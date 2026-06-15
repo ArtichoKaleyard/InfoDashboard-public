@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS 
+    "display_bsp.cpp" 
+    REQUIRES
+    esp_driver_gpio
+    esp_driver_spi
+    esp_lcd
+    freertos
+    PRIV_REQUIRES 
+    esp_timer
+    heap
+    log
+    INCLUDE_DIRS 
+    "./")

@@ -1,0 +1,187 @@
+menu "Info Dashboard Transport"
+
+    config DASHBOARD_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+        help
+            2.4 GHz WiFi SSID used by the ESP32-S3 dashboard. Leave empty to
+            keep the firmware in local empty/config state.
+
+    config DASHBOARD_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+        help
+            WiFi password for the configured SSID. Keep this in local sdkconfig
+            or menuconfig output, not in committed source.
+
+    config DASHBOARD_WIFI_SSID_1
+        string "WiFi SSID 2"
+        default ""
+        help
+            Optional second 2.4 GHz WiFi SSID. The firmware scans visible
+            networks and tries configured profiles with last-success priority.
+
+    config DASHBOARD_WIFI_PASSWORD_1
+        string "WiFi password 2"
+        default ""
+        help
+            Password for WiFi SSID 2. Keep this in local sdkconfig or
+            menuconfig output, not in committed source.
+
+    config DASHBOARD_WIFI_SSID_2
+        string "WiFi SSID 3"
+        default ""
+        help
+            Optional third 2.4 GHz WiFi SSID for alternate locations.
+
+    config DASHBOARD_WIFI_PASSWORD_2
+        string "WiFi password 3"
+        default ""
+        help
+            Password for WiFi SSID 3. Keep this in local sdkconfig or
+            menuconfig output, not in committed source.
+
+    config DASHBOARD_API_URL
+        string "Dashboard API latest URL"
+        default "https://example.com/codex-quota/api/v1/latest"
+        help
+            Full HTTPS URL for the dashboard data API. The production Codex
+            quota endpoint is
+            https://example.com/codex-quota/api/v1/latest.
+            Leave empty to keep local empty/config state.
+
+    config DASHBOARD_API_KEY
+        string "Dashboard API key"
+        default ""
+        help
+            Optional ESP32-facing API key sent as X-API-Key. Keep this in local
+            sdkconfig or menuconfig output, not in committed source.
+
+    config DASHBOARD_WEATHER_URL
+        string "Open-Meteo current weather URL"
+        default ""
+        help
+            Full HTTPS URL for current weather. Leave empty to keep weather in
+            explicit no-data state. Set this to an Open-Meteo URL for your own location.
+
+    config DASHBOARD_WEATHER_LOCATION
+        string "Weather display location"
+        default "Local"
+        help
+            Short location name displayed in the footer for the configured
+            weather URL.
+
+    config DASHBOARD_SERVER_MONITOR_URL
+        string "ServerMonitor status URL"
+        default "https://example.com/server-monitor/api/v1/targets/default/status"
+        help
+            Full HTTPS URL for the fallback ServerMonitor current-status
+            endpoint. Keep this as the Cloudflare/public route when local
+            endpoints are also configured. Leave empty to keep the
+            ServerMonitor card in explicit no-data state unless a local URL
+            below is configured.
+
+    config DASHBOARD_SERVER_MONITOR_LOCAL_URL_1
+        string "ServerMonitor local status URL 1"
+        default ""
+        help
+            Optional LAN ServerMonitor current-status endpoint for the first
+            WiFi location. When the board connects through WiFi profile 1,
+            this endpoint is tried before other ServerMonitor URLs.
+
+    config DASHBOARD_SERVER_MONITOR_LOCAL_URL_2
+        string "ServerMonitor local status URL 2"
+        default ""
+        help
+            Optional LAN ServerMonitor current-status endpoint for the second
+            WiFi location. When the board connects through WiFi profile 2,
+            this endpoint is tried before other ServerMonitor URLs.
+
+    config DASHBOARD_SERVER_MONITOR_TOKEN
+        string "ServerMonitor API token"
+        default ""
+        help
+            ServerMonitor automation API token sent as Authorization: Bearer.
+            Keep this in local sdkconfig or menuconfig output, not in committed
+            source.
+
+    config DASHBOARD_SERVER_MONITOR_DISPLAY_TARGET
+        string "ServerMonitor display target"
+        default "GPU"
+        help
+            Short stable label shown by the ServerMonitor card.
+
+    config DASHBOARD_SERVER_MONITOR_ROLE
+        string "ServerMonitor display role"
+        default "merged"
+        help
+            Short role label shown by the ServerMonitor card.
+
+    config DASHBOARD_CF_ACCESS_CLIENT_ID
+        string "Cloudflare Access client ID"
+        default ""
+        help
+            Optional Cloudflare Access service-token client ID. When both this
+            value and DASHBOARD_CF_ACCESS_CLIENT_SECRET are set, the firmware
+            sends CF-Access-Client-Id and CF-Access-Client-Secret headers.
+
+    config DASHBOARD_CF_ACCESS_CLIENT_SECRET
+        string "Cloudflare Access client secret"
+        default ""
+        help
+            Optional Cloudflare Access service-token client secret. Leave empty
+            on LAN routes that only require X-API-Key.
+
+    config DASHBOARD_SERVER_MONITOR_POLL_INTERVAL_MS
+        int "ServerMonitor poll interval in milliseconds"
+        default 1000
+        range 1000 300000
+        help
+            How often the board refreshes the ServerMonitor card after WiFi is
+            connected. Keep this relatively short because this card represents
+            live server state.
+
+    config DASHBOARD_CODEX_POLL_INTERVAL_MS
+        int "Codex quota poll interval in milliseconds"
+        default 300000
+        range 60000 3600000
+        help
+            How often the board refreshes Codex quota data after WiFi is
+            connected. Keep this lower frequency than ServerMonitor because
+            quota windows change slowly and each refresh can require multiple
+            API calls.
+
+    config DASHBOARD_WEATHER_POLL_INTERVAL_MS
+        int "Weather poll interval in milliseconds"
+        default 1800000
+        range 300000 7200000
+        help
+            How often the board refreshes Open-Meteo weather after WiFi is
+            connected. This should normally be longer than the Codex quota
+            interval because current weather is less critical on this panel.
+
+    config DASHBOARD_POLL_INTERVAL_MS
+        int "Legacy dashboard poll interval in milliseconds"
+        default 30000
+        range 5000 300000
+        help
+            Legacy compatibility setting retained for existing sdkconfig
+            values. New firmware refreshes ServerMonitor, Codex quota, and
+            weather with separate intervals above.
+
+    config DASHBOARD_SCREENSHOT_ENABLE
+        bool "Enable read-only screen screenshot endpoint"
+        default y
+        help
+            Start a small HTTP endpoint on the ESP32 that serves the current
+            final 1 bpp RLCD framebuffer as PBM at /screenshot.pbm.
+
+    config DASHBOARD_SCREENSHOT_PORT
+        int "Screen screenshot HTTP port"
+        default 8080
+        range 1024 65534
+        depends on DASHBOARD_SCREENSHOT_ENABLE
+        help
+            TCP port for the read-only screenshot endpoint.
+
+endmenu

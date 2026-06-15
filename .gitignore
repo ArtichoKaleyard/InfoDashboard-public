@@ -1,0 +1,43 @@
+# Environment variables and local secrets.
+.env
+.env.*
+!.env.example
+
+# Python virtual environments and caches.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ESP-IDF local build state.
+build/
+cmake-build-*/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+
+# Logs, temporary files, and generated previews.
+tmp/
+temp/
+cache/
+caches/
+logs/
+*.log
+*.pbm
+preview.svg
+preview.png
+
+# IDE and editor state.
+.idea/
+.vscode/
+.vs/
+.cursor/
+*.swp
+*.swo
+*.suo
+*.user
