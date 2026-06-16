@@ -327,7 +327,7 @@ constexpr char kOpenMeteoHttpPrefix[] = "http://api.open-meteo.com/";
 constexpr char kCodexUsageSummarySuffix[] = "usage-summary";
 // Codex quota history is time-bounded: live API values may display normally,
 // but cached or refresh-failure values must be marked stale and eventually cleared.
-constexpr int64_t kCodexHistoricalMaxAgeSeconds = 15 * 60;
+constexpr int64_t kCodexHistoricalMaxAgeSeconds = 6 * 60 * 60;
 constexpr char kNvsNamespace[] = "dashboard";
 constexpr char kNvsLastJsonKey[] = "last_json";
 constexpr char kNvsLastJsonEpochKey[] = "last_json_epoch";
@@ -516,6 +516,29 @@ void CopyUpperText(char *dest, size_t dest_size, const char *value) {
 const char *DiagnosticSourceForUrl(const char *url) {
     if (!url) {
         return "http";
+    }
+    const auto matches_configured_url_family = [](const char *request_url, const char *configured_url) {
+        if (!request_url || !configured_url || configured_url[0] == '\0') {
+            return false;
+        }
+        if (std::strcmp(request_url, configured_url) == 0) {
+            return true;
+        }
+        const char *last_slash = std::strrchr(configured_url, '/');
+        if (!last_slash) {
+            return false;
+        }
+        const size_t prefix_len = static_cast<size_t>(last_slash - configured_url + 1);
+        return prefix_len > std::strlen("https://") &&
+               std::strncmp(request_url, configured_url, prefix_len) == 0;
+    };
+    if (matches_configured_url_family(url, CONFIG_DASHBOARD_API_URL)) {
+        return "codex";
+    }
+    if (matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_1) ||
+        matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_2) ||
+        matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_URL)) {
+        return "server";
     }
     if (std::strstr(url, "codex-quota")) {
         return "codex";
