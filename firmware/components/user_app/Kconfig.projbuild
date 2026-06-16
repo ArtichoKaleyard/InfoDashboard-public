@@ -45,7 +45,9 @@ menu "Info Dashboard Transport"
         string "Dashboard API latest URL"
         default "https://example.com/codex-quota/api/v1/latest"
         help
-            Full HTTPS URL for the dashboard data API. Set this to your own Codex quota endpoint.
+            Full HTTPS URL for the dashboard data API. The production Codex
+            quota endpoint is
+            https://example.com/codex-quota/api/v1/latest.
             Leave empty to keep local empty/config state.
 
     config DASHBOARD_API_KEY

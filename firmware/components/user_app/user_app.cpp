@@ -2381,6 +2381,7 @@ void MergeCodexSnapshot(DashboardSnapshot *dest, const DashboardSnapshot &source
     dest->codex_week_budget_line_pct = source.codex_week_budget_line_pct;
     dest->codex_five_hour_budget_line_pct = source.codex_five_hour_budget_line_pct;
     dest->codex_trend_active_mask = source.codex_trend_active_mask;
+    dest->codex_received_epoch = source.codex_received_epoch;
     CopyText(dest->updated_at, sizeof(dest->updated_at), source.updated_at);
 }
 
@@ -3462,7 +3463,17 @@ size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
                         diagnostic.last_codex_received_epoch,
                         remote_valid && CodexSnapshotExpired(remote) ? "true" : "false");
     used = AppendJsonString(dest, dest_size, used, diagnostic.last_codex_error);
-    used = AppendFormat(dest, dest_size, used, "},\n  \"http\":{\"source\":");
+    used = AppendFormat(dest, dest_size, used,
+                        "},\n  \"remote_codex\":{\"valid\":%s,\"state\":",
+                        remote_valid ? "true" : "false");
+    used = AppendJsonString(dest, dest_size, used, remote_valid ? remote.codex_state : "");
+    used = AppendFormat(dest, dest_size, used,
+                        ",\"week_remaining_pct\":%u,\"five_hour_remaining_pct\":%u,"
+                        "\"received_epoch\":%lld,\"expired\":%s},\n  \"http\":{\"source\":",
+                        remote_valid ? remote.codex_week_remaining_pct : 0,
+                        remote_valid ? remote.codex_five_hour_remaining_pct : 0,
+                        remote_valid ? remote.codex_received_epoch : 0,
+                        remote_valid && CodexSnapshotExpired(remote) ? "true" : "false");
     used = AppendJsonString(dest, dest_size, used, diagnostic.last_http_source);
     used = AppendFormat(dest, dest_size, used, ",\"result\":");
     used = AppendJsonString(dest, dest_size, used, diagnostic.last_http_result);
