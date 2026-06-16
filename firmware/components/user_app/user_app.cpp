@@ -5,6 +5,7 @@
 #include "dashboard_widgets.h"
 
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -131,6 +132,8 @@ enum class NetworkJob : uint8_t {
     kCount,
 };
 
+const char *NetworkJobName(NetworkJob job);
+
 struct NetworkJobRequest {
     bool pending;
     uint32_t sequence;
@@ -145,6 +148,42 @@ struct NetworkJobResult {
     bool ok;
     bool usage_summary_ok;
     int64_t elapsed_ms;
+};
+
+struct DiagnosticEntry {
+    uint32_t sequence;
+    int64_t uptime_ms;
+    char source[12];
+    char event[20];
+    char detail[96];
+};
+
+struct DiagnosticState {
+    uint32_t next_sequence;
+    uint32_t total_entries;
+    DiagnosticEntry entries[16];
+    int last_http_status;
+    int last_http_errno;
+    int last_http_tls_error;
+    int last_http_tls_flags;
+    int64_t last_http_elapsed_ms;
+    int last_http_len;
+    bool last_http_overflow;
+    char last_http_source[12];
+    char last_http_result[20];
+    char last_codex_state[12];
+    char last_codex_link_state[18];
+    int last_codex_week_remaining_pct;
+    int last_codex_five_hour_remaining_pct;
+    int64_t last_codex_received_epoch;
+    bool last_codex_fetch_ok;
+    bool last_codex_usage_summary_ok;
+    bool last_codex_json_ok;
+    char last_codex_error[28];
+    char last_worker_job[12];
+    bool last_worker_ok;
+    bool last_worker_usage_summary_ok;
+    int64_t last_worker_elapsed_ms;
 };
 
 struct WifiProfile {
@@ -310,8 +349,10 @@ uint8_t g_active_wifi_profile = kWifiInvalidProfile;
 SemaphoreHandle_t g_snapshot_mutex = nullptr;
 SemaphoreHandle_t g_http_mutex = nullptr;
 SemaphoreHandle_t g_network_queue_mutex = nullptr;
+SemaphoreHandle_t g_diagnostic_mutex = nullptr;
 DashboardSnapshot g_remote_snapshot = {};
 bool g_remote_snapshot_valid = false;
+DiagnosticState g_diagnostics = {};
 char g_codex_response[kHttpResponseCapacity] = {};
 char g_weather_response[kHttpResponseCapacity] = {};
 char g_server_monitor_response[kHttpResponseCapacity] = {};
@@ -469,6 +510,127 @@ void CopyUpperText(char *dest, size_t dest_size, const char *value) {
     CopyText(dest, dest_size, value);
     for (size_t i = 0; dest[i] != '\0'; ++i) {
         dest[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(dest[i])));
+    }
+}
+
+const char *DiagnosticSourceForUrl(const char *url) {
+    if (!url) {
+        return "http";
+    }
+    if (std::strstr(url, "codex-quota")) {
+        return "codex";
+    }
+    if (std::strstr(url, "server-monitor")) {
+        return "server";
+    }
+    if (std::strstr(url, "open-meteo")) {
+        return "weather";
+    }
+    return "http";
+}
+
+void DiagnosticLog(const char *source, const char *event, const char *detail, ...) {
+    if (!g_diagnostic_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return;
+    }
+    DiagnosticState &state = g_diagnostics;
+    const uint32_t sequence = ++state.next_sequence;
+    DiagnosticEntry &entry = state.entries[(sequence - 1) % (sizeof(state.entries) / sizeof(state.entries[0]))];
+    entry.sequence = sequence;
+    entry.uptime_ms = esp_timer_get_time() / 1000LL;
+    CopyText(entry.source, sizeof(entry.source), source ? source : "--");
+    CopyText(entry.event, sizeof(entry.event), event ? event : "--");
+    if (detail && detail[0] != '\0') {
+        va_list args;
+        va_start(args, detail);
+        std::vsnprintf(entry.detail, sizeof(entry.detail), detail, args);
+        va_end(args);
+    } else {
+        entry.detail[0] = '\0';
+    }
+    ++state.total_entries;
+    xSemaphoreGive(g_diagnostic_mutex);
+}
+
+void DiagnosticRecordHttp(const char *url,
+                          const char *result,
+                          int status,
+                          int length,
+                          bool overflow,
+                          int64_t elapsed_ms,
+                          int socket_errno,
+                          int tls_error,
+                          int tls_flags) {
+    if (!g_diagnostic_mutex) {
+        return;
+    }
+    const char *source = DiagnosticSourceForUrl(url);
+    const bool high_frequency_success = std::strcmp(source, "server") == 0 &&
+                                        std::strcmp(result, "http_ok") == 0;
+    if (!high_frequency_success &&
+        xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        g_diagnostics.last_http_status = status;
+        g_diagnostics.last_http_errno = socket_errno;
+        g_diagnostics.last_http_tls_error = tls_error;
+        g_diagnostics.last_http_tls_flags = tls_flags;
+        g_diagnostics.last_http_elapsed_ms = elapsed_ms;
+        g_diagnostics.last_http_len = length;
+        g_diagnostics.last_http_overflow = overflow;
+        CopyText(g_diagnostics.last_http_source, sizeof(g_diagnostics.last_http_source), source);
+        CopyText(g_diagnostics.last_http_result, sizeof(g_diagnostics.last_http_result), result);
+        xSemaphoreGive(g_diagnostic_mutex);
+    }
+    if (!high_frequency_success) {
+        DiagnosticLog(source, result, "status=%d len=%d overflow=%d elapsed=%lldms errno=%d tls=0x%x flags=0x%x",
+                      status, length, overflow ? 1 : 0, elapsed_ms, socket_errno, tls_error, tls_flags);
+    }
+}
+
+void DiagnosticRecordCodex(const DashboardSnapshot &snapshot,
+                           bool fetch_ok,
+                           bool usage_summary_ok,
+                           bool json_ok,
+                           const char *error) {
+    if (g_diagnostic_mutex &&
+        xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        CopyText(g_diagnostics.last_codex_state, sizeof(g_diagnostics.last_codex_state), snapshot.codex_state);
+        CopyText(g_diagnostics.last_codex_link_state, sizeof(g_diagnostics.last_codex_link_state), snapshot.link_state);
+        g_diagnostics.last_codex_week_remaining_pct = snapshot.codex_week_remaining_pct;
+        g_diagnostics.last_codex_five_hour_remaining_pct = snapshot.codex_five_hour_remaining_pct;
+        g_diagnostics.last_codex_received_epoch = snapshot.codex_received_epoch;
+        g_diagnostics.last_codex_fetch_ok = fetch_ok;
+        g_diagnostics.last_codex_usage_summary_ok = usage_summary_ok;
+        g_diagnostics.last_codex_json_ok = json_ok;
+        CopyText(g_diagnostics.last_codex_error, sizeof(g_diagnostics.last_codex_error), error ? error : "");
+        xSemaphoreGive(g_diagnostic_mutex);
+    }
+    DiagnosticLog("codex", fetch_ok ? "fetch_ok" : "fetch_fail",
+                  "json=%d usage_summary=%d state=%s week=%u five_hour=%u err=%s",
+                  json_ok ? 1 : 0,
+                  usage_summary_ok ? 1 : 0,
+                  snapshot.codex_state,
+                  snapshot.codex_week_remaining_pct,
+                  snapshot.codex_five_hour_remaining_pct,
+                  error ? error : "");
+}
+
+void DiagnosticRecordWorker(NetworkJob job, bool ok, bool usage_summary_ok, int64_t elapsed_ms) {
+    const bool high_frequency_success = job == NetworkJob::kServerMonitor && ok;
+    if (!high_frequency_success &&
+        g_diagnostic_mutex &&
+        xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        CopyText(g_diagnostics.last_worker_job, sizeof(g_diagnostics.last_worker_job), NetworkJobName(job));
+        g_diagnostics.last_worker_ok = ok;
+        g_diagnostics.last_worker_usage_summary_ok = usage_summary_ok;
+        g_diagnostics.last_worker_elapsed_ms = elapsed_ms;
+        xSemaphoreGive(g_diagnostic_mutex);
+    }
+    if (!high_frequency_success) {
+        DiagnosticLog(NetworkJobName(job), "worker_finish", "ok=%d usage_summary=%d elapsed=%lldms",
+                      ok ? 1 : 0, usage_summary_ok ? 1 : 0, elapsed_ms);
     }
 }
 
@@ -1070,6 +1232,7 @@ bool WaitForSystemTimeIfHttps(const char *url) {
         vTaskDelay(pdMS_TO_TICKS(250));
     }
     ESP_LOGW(kTag, "HTTPS fetch before clock sync: url=%s", url ? url : "");
+    DiagnosticLog(DiagnosticSourceForUrl(url), "clock_wait_timeout", "https request blocked before time sync");
     return false;
 }
 
@@ -1830,12 +1993,16 @@ bool PerformHttpPayload(esp_http_client_handle_t client,
         int tls_flags = 0;
         esp_http_client_get_and_clear_last_tls_error(client, &tls_error, &tls_flags);
         const int socket_errno = esp_http_client_get_errno(client);
+        DiagnosticRecordHttp(url, "http_fail", status, buffer->length, buffer->overflow,
+                             request_elapsed_ms, socket_errno, tls_error, tls_flags);
         ESP_LOGW(kTag,
                  "API fetch failed: err=%s status=%d len=%d overflow=%d elapsed=%lldms errno=%d tls=0x%x flags=0x%x url=%s",
                  esp_err_to_name(err), status, buffer->length, buffer->overflow ? 1 : 0,
                  request_elapsed_ms, socket_errno, tls_error, tls_flags, url);
         return false;
     }
+    DiagnosticRecordHttp(url, "http_ok", status, buffer->length, buffer->overflow,
+                         request_elapsed_ms, 0, 0, 0);
     return true;
 }
 
@@ -1847,6 +2014,7 @@ bool TakeHttpMutex(const char *url) {
         return true;
     }
     ESP_LOGW(kTag, "HTTP fetch skipped: mutex wait timeout url=%s", url ? url : "");
+    DiagnosticLog(DiagnosticSourceForUrl(url), "http_mutex_timeout", "wait=%dms", kHttpMutexWaitMs);
     return false;
 }
 
@@ -1949,10 +2117,12 @@ bool FetchCodexSnapshot(DashboardSnapshot *snapshot, bool *usage_summary_ok) {
     }
     if (std::strlen(CONFIG_DASHBOARD_API_URL) == 0) {
         CopyText(snapshot->link_state, sizeof(snapshot->link_state), "URL CFG");
+        DiagnosticRecordCodex(*snapshot, false, false, false, "url_config_missing");
         return false;
     }
     if (std::strlen(CONFIG_DASHBOARD_API_KEY) == 0) {
         CopyText(snapshot->link_state, sizeof(snapshot->link_state), "KEY CFG");
+        DiagnosticRecordCodex(*snapshot, false, false, false, "api_key_missing");
         return false;
     }
 
@@ -1965,20 +2135,26 @@ bool FetchCodexSnapshot(DashboardSnapshot *snapshot, bool *usage_summary_ok) {
         bool trends_ok = false;
         if (!ParseCodexQuotaUsageSummaryJson(response, snapshot, &trends_ok)) {
             CopyText(snapshot->link_state, sizeof(snapshot->link_state), "JSON ERR");
+            DiagnosticRecordCodex(*snapshot, false, false, false, "usage_summary_json");
             return false;
         }
         if (usage_summary_ok) {
             *usage_summary_ok = trends_ok;
+        }
+        if (!trends_ok) {
+            DiagnosticRecordCodex(*snapshot, true, false, true, "usage_summary_incomplete");
         }
     } else {
         response[0] = '\0';
         ESP_LOGW(kTag, "dashboard API usage-summary failed, retrying latest");
         if (!FetchHttpPayload(CONFIG_DASHBOARD_API_URL, response, kHttpResponseCapacity, HttpAuth::kCodexApiKey)) {
             CopyText(snapshot->link_state, sizeof(snapshot->link_state), "STALE");
+            DiagnosticRecordCodex(*snapshot, false, false, false, "latest_http");
             return false;
         }
         if (!ParseCodexQuotaLatestJson(response, snapshot)) {
             CopyText(snapshot->link_state, sizeof(snapshot->link_state), "JSON ERR");
+            DiagnosticRecordCodex(*snapshot, false, false, false, "latest_json");
             return false;
         }
     }
@@ -1991,6 +2167,7 @@ bool FetchCodexSnapshot(DashboardSnapshot *snapshot, bool *usage_summary_ok) {
              snapshot->codex_week_remaining_pct,
              snapshot->codex_five_hour_remaining_pct);
     CopyText(snapshot->link_state, sizeof(snapshot->link_state), "API OK");
+    DiagnosticRecordCodex(*snapshot, true, usage_summary_ok ? *usage_summary_ok : false, true, "");
     return true;
 }
 
@@ -2688,6 +2865,7 @@ uint32_t SubmitNetworkJob(NetworkJob job, int64_t due_us, int64_t stale_after_ms
     }
     if (xSemaphoreTake(g_network_queue_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGW(kTag, "net queue submit skipped: mutex timeout job=%s", NetworkJobName(job));
+        DiagnosticLog(NetworkJobName(job), "queue_mutex_timeout", "submit");
         return 0;
     }
     const size_t index = NetworkJobIndex(job);
@@ -2712,6 +2890,10 @@ uint32_t SubmitNetworkJob(NetworkJob job, int64_t due_us, int64_t stale_after_ms
              sequence,
              overdue_ms,
              stale_after_ms);
+    if (job != NetworkJob::kServerMonitor) {
+        DiagnosticLog(NetworkJobName(job), coalesced ? "queue_coalesce" : "queue_submit",
+                      "seq=%u overdue=%lldms stale=%lldms", sequence, overdue_ms, stale_after_ms);
+    }
     return sequence;
 }
 
@@ -2791,6 +2973,8 @@ bool PopNextNetworkJob(NetworkJob *job, NetworkJobRequest *request) {
         selected_job != NetworkJob::kServerMonitor) {
         ESP_LOGW(kTag, "net queue drop stale: job=%s seq=%u age=%lldms stale=%lldms",
                  NetworkJobName(selected_job), selected.sequence, age_ms, selected.stale_after_ms);
+        DiagnosticLog(NetworkJobName(selected_job), "queue_drop_stale",
+                      "seq=%u age=%lldms stale=%lldms", selected.sequence, age_ms, selected.stale_after_ms);
         StoreNetworkJobResult(selected_job, selected, false, false, -1);
         return false;
     }
@@ -2951,6 +3135,7 @@ void NetworkWorkerTask(void *arg) {
                  "net worker finish: job=%s seq=%u ok=%d elapsed=%lldms total=%lldms usage_summary=%d",
                  NetworkJobName(job), request.sequence, ok ? 1 : 0,
                  source_elapsed_ms, total_elapsed_ms, usage_summary_ok ? 1 : 0);
+        DiagnosticRecordWorker(job, ok, usage_summary_ok, source_elapsed_ms);
         StoreNetworkJobResult(job, request, ok, usage_summary_ok, source_elapsed_ms);
     }
 }
@@ -3194,6 +3379,185 @@ void StartDashboardTask(TaskFunction_t task, const char *name, uint32_t stack_wo
 
 }  // 匿名命名空间
 
+namespace {
+
+size_t AppendFormat(char *dest, size_t dest_size, size_t used, const char *format, ...) {
+    if (!dest || dest_size == 0 || used >= dest_size) {
+        return used;
+    }
+    va_list args;
+    va_start(args, format);
+    const int written = std::vsnprintf(dest + used, dest_size - used, format, args);
+    va_end(args);
+    if (written < 0) {
+        return used;
+    }
+    const size_t available = dest_size - used;
+    const size_t advance = static_cast<size_t>(written);
+    return used + (advance < available ? advance : available - 1);
+}
+
+size_t AppendJsonString(char *dest, size_t dest_size, size_t used, const char *value) {
+    used = AppendFormat(dest, dest_size, used, "\"");
+    for (const char *cursor = value ? value : ""; *cursor != '\0' && used + 2 < dest_size; ++cursor) {
+        const char ch = *cursor;
+        if (ch == '"' || ch == '\\') {
+            used = AppendFormat(dest, dest_size, used, "\\%c", ch);
+        } else if (ch == '\n') {
+            used = AppendFormat(dest, dest_size, used, "\\n");
+        } else if (ch == '\r') {
+            used = AppendFormat(dest, dest_size, used, "\\r");
+        } else if (static_cast<unsigned char>(ch) < 0x20) {
+            used = AppendFormat(dest, dest_size, used, "?");
+        } else {
+            used = AppendFormat(dest, dest_size, used, "%c", ch);
+        }
+    }
+    return AppendFormat(dest, dest_size, used, "\"");
+}
+
+}  // namespace
+
+size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
+    if (!dest || dest_size == 0) {
+        return 0;
+    }
+    dest[0] = '\0';
+    DiagnosticState diagnostic = {};
+    DashboardSnapshot remote = {};
+    const bool remote_valid = LoadRemoteSnapshot(&remote);
+    if (g_diagnostic_mutex &&
+        xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        diagnostic = g_diagnostics;
+        xSemaphoreGive(g_diagnostic_mutex);
+    }
+
+    size_t used = 0;
+    used = AppendFormat(dest, dest_size, used,
+                        "{\n  \"uptime_ms\":%lld,\n  \"epoch\":%lld,\n  \"transport_ready\":%s,\n"
+                        "  \"config\":{\"codex_url\":%s,\"codex_api_key\":%s,\"cf_access\":%s,\"server_monitor\":%s},\n"
+                        "  \"snapshot_valid\":%s,\n",
+                        esp_timer_get_time() / 1000LL,
+                        CurrentEpochSeconds(),
+                        TransportReady() ? "true" : "false",
+                        std::strlen(CONFIG_DASHBOARD_API_URL) > 0 ? "true" : "false",
+                        std::strlen(CONFIG_DASHBOARD_API_KEY) > 0 ? "true" : "false",
+                        (std::strlen(CONFIG_DASHBOARD_CF_ACCESS_CLIENT_ID) > 0 &&
+                         std::strlen(CONFIG_DASHBOARD_CF_ACCESS_CLIENT_SECRET) > 0) ? "true" : "false",
+                        ServerMonitorConfigured() ? "true" : "false",
+                        remote_valid ? "true" : "false");
+    used = AppendFormat(dest, dest_size, used,
+                        "  \"codex\":{\"fetch_ok\":%s,\"usage_summary_ok\":%s,\"json_ok\":%s,\"state\":",
+                        diagnostic.last_codex_fetch_ok ? "true" : "false",
+                        diagnostic.last_codex_usage_summary_ok ? "true" : "false",
+                        diagnostic.last_codex_json_ok ? "true" : "false");
+    used = AppendJsonString(dest, dest_size, used, diagnostic.last_codex_state);
+    used = AppendFormat(dest, dest_size, used, ",\"link_state\":");
+    used = AppendJsonString(dest, dest_size, used, diagnostic.last_codex_link_state);
+    used = AppendFormat(dest, dest_size, used,
+                        ",\"week_remaining_pct\":%d,\"five_hour_remaining_pct\":%d,"
+                        "\"received_epoch\":%lld,\"expired\":%s,\"error\":",
+                        diagnostic.last_codex_week_remaining_pct,
+                        diagnostic.last_codex_five_hour_remaining_pct,
+                        diagnostic.last_codex_received_epoch,
+                        remote_valid && CodexSnapshotExpired(remote) ? "true" : "false");
+    used = AppendJsonString(dest, dest_size, used, diagnostic.last_codex_error);
+    used = AppendFormat(dest, dest_size, used, "},\n  \"http\":{\"source\":");
+    used = AppendJsonString(dest, dest_size, used, diagnostic.last_http_source);
+    used = AppendFormat(dest, dest_size, used, ",\"result\":");
+    used = AppendJsonString(dest, dest_size, used, diagnostic.last_http_result);
+    used = AppendFormat(dest, dest_size, used,
+                        ",\"status\":%d,\"len\":%d,\"overflow\":%s,\"elapsed_ms\":%lld,"
+                        "\"errno\":%d,\"tls_error\":%d,\"tls_flags\":%d},\n",
+                        diagnostic.last_http_status,
+                        diagnostic.last_http_len,
+                        diagnostic.last_http_overflow ? "true" : "false",
+                        diagnostic.last_http_elapsed_ms,
+                        diagnostic.last_http_errno,
+                        diagnostic.last_http_tls_error,
+                        diagnostic.last_http_tls_flags);
+    used = AppendFormat(dest, dest_size, used, "  \"worker\":{\"job\":");
+    used = AppendJsonString(dest, dest_size, used, diagnostic.last_worker_job);
+    used = AppendFormat(dest, dest_size, used,
+                        ",\"ok\":%s,\"usage_summary_ok\":%s,\"elapsed_ms\":%lld},\n  \"logs\":[\n",
+                        diagnostic.last_worker_ok ? "true" : "false",
+                        diagnostic.last_worker_usage_summary_ok ? "true" : "false",
+                        diagnostic.last_worker_elapsed_ms);
+
+    const size_t capacity = sizeof(diagnostic.entries) / sizeof(diagnostic.entries[0]);
+    const uint32_t count = diagnostic.total_entries < capacity ? diagnostic.total_entries : capacity;
+    const uint32_t start_sequence = diagnostic.next_sequence >= count ? diagnostic.next_sequence - count + 1 : 1;
+    for (uint32_t offset = 0; offset < count; ++offset) {
+        const uint32_t sequence = start_sequence + offset;
+        const DiagnosticEntry &entry = diagnostic.entries[(sequence - 1) % capacity];
+        used = AppendFormat(dest, dest_size, used, "    {\"seq\":%u,\"uptime_ms\":%lld,\"source\":",
+                            entry.sequence, entry.uptime_ms);
+        used = AppendJsonString(dest, dest_size, used, entry.source);
+        used = AppendFormat(dest, dest_size, used, ",\"event\":");
+        used = AppendJsonString(dest, dest_size, used, entry.event);
+        used = AppendFormat(dest, dest_size, used, ",\"detail\":");
+        used = AppendJsonString(dest, dest_size, used, entry.detail);
+        used = AppendFormat(dest, dest_size, used, "}%s\n", offset + 1 < count ? "," : "");
+    }
+    used = AppendFormat(dest, dest_size, used, "  ]\n}\n");
+    return used;
+}
+
+size_t UserApp_WriteLogsText(char *dest, size_t dest_size) {
+    if (!dest || dest_size == 0) {
+        return 0;
+    }
+    dest[0] = '\0';
+    DiagnosticState diagnostic = {};
+    if (g_diagnostic_mutex &&
+        xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        diagnostic = g_diagnostics;
+        xSemaphoreGive(g_diagnostic_mutex);
+    }
+
+    size_t used = 0;
+    used = AppendFormat(dest, dest_size, used,
+                        "InfoDashboard diagnostics\n"
+                        "uptime_ms=%lld epoch=%lld transport_ready=%d\n"
+                        "codex fetch_ok=%d usage_summary_ok=%d json_ok=%d state=%s week=%d five_hour=%d received_epoch=%lld err=%s\n"
+                        "http source=%s result=%s status=%d len=%d overflow=%d elapsed_ms=%lld errno=%d tls_error=%d tls_flags=%d\n"
+                        "worker job=%s ok=%d usage_summary_ok=%d elapsed_ms=%lld\n\nRecent logs:\n",
+                        esp_timer_get_time() / 1000LL,
+                        CurrentEpochSeconds(),
+                        TransportReady() ? 1 : 0,
+                        diagnostic.last_codex_fetch_ok ? 1 : 0,
+                        diagnostic.last_codex_usage_summary_ok ? 1 : 0,
+                        diagnostic.last_codex_json_ok ? 1 : 0,
+                        diagnostic.last_codex_state,
+                        diagnostic.last_codex_week_remaining_pct,
+                        diagnostic.last_codex_five_hour_remaining_pct,
+                        diagnostic.last_codex_received_epoch,
+                        diagnostic.last_codex_error,
+                        diagnostic.last_http_source,
+                        diagnostic.last_http_result,
+                        diagnostic.last_http_status,
+                        diagnostic.last_http_len,
+                        diagnostic.last_http_overflow ? 1 : 0,
+                        diagnostic.last_http_elapsed_ms,
+                        diagnostic.last_http_errno,
+                        diagnostic.last_http_tls_error,
+                        diagnostic.last_http_tls_flags,
+                        diagnostic.last_worker_job,
+                        diagnostic.last_worker_ok ? 1 : 0,
+                        diagnostic.last_worker_usage_summary_ok ? 1 : 0,
+                        diagnostic.last_worker_elapsed_ms);
+    const size_t capacity = sizeof(diagnostic.entries) / sizeof(diagnostic.entries[0]);
+    const uint32_t count = diagnostic.total_entries < capacity ? diagnostic.total_entries : capacity;
+    const uint32_t start_sequence = diagnostic.next_sequence >= count ? diagnostic.next_sequence - count + 1 : 1;
+    for (uint32_t offset = 0; offset < count; ++offset) {
+        const uint32_t sequence = start_sequence + offset;
+        const DiagnosticEntry &entry = diagnostic.entries[(sequence - 1) % capacity];
+        used = AppendFormat(dest, dest_size, used, "#%u %lldms %-7s %-18s %s\n",
+                            entry.sequence, entry.uptime_ms, entry.source, entry.event, entry.detail);
+    }
+    return used;
+}
+
 void UserApp_AppInit(void) {
     ESP_LOGI(kTag, "info dashboard app init");
     InitNvs();
@@ -3208,6 +3572,10 @@ void UserApp_AppInit(void) {
     g_network_queue_mutex = xSemaphoreCreateMutex();
     if (!g_network_queue_mutex) {
         ESP_LOGW(kTag, "network queue mutex init failed");
+    }
+    g_diagnostic_mutex = xSemaphoreCreateMutex();
+    if (!g_diagnostic_mutex) {
+        ESP_LOGW(kTag, "diagnostic mutex init failed");
     }
     InitBatteryAdc();
     InitShtc3();
