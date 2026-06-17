@@ -112,6 +112,7 @@ struct DashboardSnapshot {
     uint8_t codex_week_budget_line_pct;
     uint8_t codex_five_hour_budget_line_pct;
     uint16_t codex_trend_active_mask;
+    bool codex_trends_ready;
     int64_t codex_received_epoch;
     char updated_at[32];
     char link_state[18];
@@ -327,7 +328,7 @@ constexpr char kOpenMeteoHttpPrefix[] = "http://api.open-meteo.com/";
 constexpr char kCodexUsageSummarySuffix[] = "usage-summary";
 // Codex quota history is time-bounded: live API values may display normally,
 // but cached or refresh-failure values must be marked stale and eventually cleared.
-constexpr int64_t kCodexHistoricalMaxAgeSeconds = 6 * 60 * 60;
+constexpr int64_t kCodexHistoricalMaxAgeSeconds = 30 * 60;
 constexpr char kNvsNamespace[] = "dashboard";
 constexpr char kNvsLastJsonKey[] = "last_json";
 constexpr char kNvsLastJsonEpochKey[] = "last_json_epoch";
@@ -485,6 +486,11 @@ size_t BuildServerMonitorEndpointOrder(ServerMonitorEndpoint *endpoints, size_t 
 bool ServerMonitorEndpointIsPreferred(const ServerMonitorEndpoint &endpoint) {
     return endpoint.wifi_profile != kWifiInvalidProfile &&
            endpoint.wifi_profile == g_active_wifi_profile;
+}
+
+bool ServerMonitorSnapshotUsable(const DashboardSnapshot &snapshot) {
+    return !SameText(snapshot.server_state, "OFFLINE") &&
+           !SameText(snapshot.server_state, "ERROR");
 }
 
 bool CurrentWifiHasPreferredServerMonitorEndpoint() {
@@ -1507,6 +1513,7 @@ void BuildEmptySnapshot(DashboardSnapshot *snapshot) {
     snapshot->codex_week_budget_line_pct = static_cast<uint8_t>(kMiniChartBudgetLinePct + 0.5);
     snapshot->codex_five_hour_budget_line_pct = static_cast<uint8_t>(kMiniChartBudgetLinePct + 0.5);
     snapshot->codex_trend_active_mask = 0;
+    snapshot->codex_trends_ready = false;
     snapshot->codex_received_epoch = 0;
     CopyText(snapshot->updated_at, sizeof(snapshot->updated_at), "");
     CopyText(snapshot->link_state, sizeof(snapshot->link_state), "NO DATA");
@@ -1567,6 +1574,7 @@ void ClearCodexQuota(DashboardSnapshot *snapshot) {
     snapshot->codex_week_budget_line_pct = static_cast<uint8_t>(kMiniChartBudgetLinePct + 0.5);
     snapshot->codex_five_hour_budget_line_pct = static_cast<uint8_t>(kMiniChartBudgetLinePct + 0.5);
     snapshot->codex_trend_active_mask = 0;
+    snapshot->codex_trends_ready = false;
     snapshot->codex_received_epoch = 0;
 }
 
@@ -1671,6 +1679,9 @@ bool ParseCodexQuotaLatestJson(const char *payload, DashboardSnapshot *snapshot)
     const cJSON *data = JsonObjectItem(root, "data");
     const cJSON *meta = JsonObjectItem(root, "meta");
     const bool ok = ParseCodexQuotaSampleData(data, meta, snapshot);
+    if (ok) {
+        snapshot->codex_trends_ready = false;
+    }
     cJSON_Delete(root);
     return ok;
 }
@@ -1755,6 +1766,7 @@ bool ParseCodexQuotaUsageSummaryJson(const char *payload, DashboardSnapshot *sna
         if (trends_ok) {
             *trends_ok = week_ok && five_hour_ok;
         }
+        snapshot->codex_trends_ready = week_ok && five_hour_ok;
     }
     cJSON_Delete(root);
     return ok;
@@ -1838,6 +1850,10 @@ bool ParseDashboardJson(const char *payload, DashboardSnapshot *snapshot) {
                 }
             }
         }
+        const bool has_week_trend = cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(codex, "weekly_trend_pct")) ||
+                                    cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(codex, "trend_pct"));
+        const bool has_five_hour_trend = cJSON_IsArray(cJSON_GetObjectItemCaseSensitive(codex, "five_hour_trend_pct"));
+        snapshot->codex_trends_ready = has_week_trend && has_five_hour_trend;
     }
 
     CopyText(snapshot->link_state, sizeof(snapshot->link_state), "WIFI OK");
@@ -2154,32 +2170,25 @@ bool FetchCodexSnapshot(DashboardSnapshot *snapshot, bool *usage_summary_ok) {
     char summary_url[192] = {};
     BuildCodexApiSiblingUrl(summary_url, sizeof(summary_url), kCodexUsageSummarySuffix);
     ESP_LOGI(kTag, "dashboard API fetch start: usage-summary");
-    if (FetchHttpPayload(summary_url, response, kHttpResponseCapacity, HttpAuth::kCodexApiKey)) {
-        bool trends_ok = false;
-        if (!ParseCodexQuotaUsageSummaryJson(response, snapshot, &trends_ok)) {
-            CopyText(snapshot->link_state, sizeof(snapshot->link_state), "JSON ERR");
-            DiagnosticRecordCodex(*snapshot, false, false, false, "usage_summary_json");
-            return false;
-        }
-        if (usage_summary_ok) {
-            *usage_summary_ok = trends_ok;
-        }
-        if (!trends_ok) {
-            DiagnosticRecordCodex(*snapshot, true, false, true, "usage_summary_incomplete");
-        }
-    } else {
-        response[0] = '\0';
-        ESP_LOGW(kTag, "dashboard API usage-summary failed, retrying latest");
-        if (!FetchHttpPayload(CONFIG_DASHBOARD_API_URL, response, kHttpResponseCapacity, HttpAuth::kCodexApiKey)) {
-            CopyText(snapshot->link_state, sizeof(snapshot->link_state), "STALE");
-            DiagnosticRecordCodex(*snapshot, false, false, false, "latest_http");
-            return false;
-        }
-        if (!ParseCodexQuotaLatestJson(response, snapshot)) {
-            CopyText(snapshot->link_state, sizeof(snapshot->link_state), "JSON ERR");
-            DiagnosticRecordCodex(*snapshot, false, false, false, "latest_json");
-            return false;
-        }
+    if (!FetchHttpPayload(summary_url, response, kHttpResponseCapacity, HttpAuth::kCodexApiKey)) {
+        CopyText(snapshot->link_state, sizeof(snapshot->link_state), "STALE");
+        DiagnosticRecordCodex(*snapshot, false, false, false, "usage_summary_http");
+        return false;
+    }
+    bool trends_ok = false;
+    if (!ParseCodexQuotaUsageSummaryJson(response, snapshot, &trends_ok)) {
+        CopyText(snapshot->link_state, sizeof(snapshot->link_state), "JSON ERR");
+        DiagnosticRecordCodex(*snapshot, false, false, false, "usage_summary_json");
+        return false;
+    }
+    if (usage_summary_ok) {
+        *usage_summary_ok = trends_ok;
+    }
+    if (!trends_ok) {
+        CopyText(snapshot->link_state, sizeof(snapshot->link_state), "STALE");
+        MarkCodexQuotaStale(snapshot);
+        DiagnosticRecordCodex(*snapshot, false, false, true, "usage_summary_incomplete");
+        return false;
     }
     SaveDashboardCache(response);
     snapshot->codex_received_epoch = CurrentEpochSeconds();
@@ -2255,6 +2264,10 @@ bool FetchServerMonitorSnapshot(DashboardSnapshot *snapshot, int64_t *elapsed_ms
 
     char *response = g_server_monitor_response;
     int64_t last_elapsed_ms = -1;
+    const DashboardSnapshot base_snapshot = *snapshot;
+    DashboardSnapshot fallback_snapshot = {};
+    bool fallback_snapshot_valid = false;
+    int64_t fallback_elapsed_ms = -1;
     for (size_t attempt = 0; attempt < endpoint_count; ++attempt) {
         const size_t slot = (g_server_monitor_endpoint_cursor + attempt) % endpoint_count;
         const ServerMonitorEndpoint &endpoint = endpoints[slot];
@@ -2278,12 +2291,25 @@ bool FetchServerMonitorSnapshot(DashboardSnapshot *snapshot, int64_t *elapsed_ms
             last_elapsed_ms = attempt_elapsed_ms;
             continue;
         }
-        if (!ParseServerMonitorJson(response, snapshot)) {
+        DashboardSnapshot candidate = base_snapshot;
+        if (!ParseServerMonitorJson(response, &candidate)) {
             ESP_LOGW(kTag, "ServerMonitor JSON parse failed: endpoint=%s", endpoint.label);
             ResetServerMonitorClient();
             last_elapsed_ms = attempt_elapsed_ms;
             continue;
         }
+        if (!ServerMonitorSnapshotUsable(candidate) && attempt + 1 < endpoint_count) {
+            if (!fallback_snapshot_valid) {
+                fallback_snapshot = candidate;
+                fallback_elapsed_ms = attempt_elapsed_ms;
+                fallback_snapshot_valid = true;
+            }
+            ESP_LOGW(kTag, "ServerMonitor endpoint reported unavailable: %s state=%s elapsed=%lldms",
+                     endpoint.label, candidate.server_state, attempt_elapsed_ms);
+            last_elapsed_ms = attempt_elapsed_ms;
+            continue;
+        }
+        *snapshot = candidate;
         if (!CurrentWifiHasPreferredServerMonitorEndpoint() ||
             ServerMonitorEndpointIsPreferred(endpoint)) {
             g_server_monitor_endpoint_cursor = slot;
@@ -2299,6 +2325,15 @@ bool FetchServerMonitorSnapshot(DashboardSnapshot *snapshot, int64_t *elapsed_ms
         ESP_LOGI(kTag, "ServerMonitor fetch ok: endpoint=%s state=%s latency=%ums cpu=%u%% mem=%u%% elapsed=%lldms",
                  endpoint.label, snapshot->server_state, snapshot->server_latency_ms,
                  snapshot->server_cpu_pct, snapshot->server_mem_pct, attempt_elapsed_ms);
+        return true;
+    }
+    if (fallback_snapshot_valid) {
+        *snapshot = fallback_snapshot;
+        if (elapsed_ms) {
+            *elapsed_ms = fallback_elapsed_ms;
+        }
+        CopyLocalUpdatedTimestamp(snapshot->updated_at, sizeof(snapshot->updated_at));
+        CopyText(snapshot->link_state, sizeof(snapshot->link_state), "API OK");
         return true;
     }
     if (elapsed_ms) {
@@ -2404,6 +2439,7 @@ void MergeCodexSnapshot(DashboardSnapshot *dest, const DashboardSnapshot &source
     dest->codex_week_budget_line_pct = source.codex_week_budget_line_pct;
     dest->codex_five_hour_budget_line_pct = source.codex_five_hour_budget_line_pct;
     dest->codex_trend_active_mask = source.codex_trend_active_mask;
+    dest->codex_trends_ready = source.codex_trends_ready;
     dest->codex_received_epoch = source.codex_received_epoch;
     CopyText(dest->updated_at, sizeof(dest->updated_at), source.updated_at);
 }
@@ -2695,7 +2731,8 @@ void ApplySnapshot(const DashboardSnapshot &snapshot) {
     lv_label_set_text_fmt(g_ui.server_mem_value, text::kMemFormat, snapshot.server_mem_pct);
     lv_label_set_text_fmt(g_ui.server_ping_value, text::kProcFormat, snapshot.gpu_processes);
 
-    const bool codex_values_ready = std::strcmp(snapshot.codex_state, "NO_DATA") != 0 &&
+    const bool codex_values_ready = snapshot.codex_trends_ready &&
+                                    std::strcmp(snapshot.codex_state, "NO_DATA") != 0 &&
                                     std::strcmp(snapshot.codex_state, "VERIFY") != 0;
     lv_label_set_text(g_ui.codex_state, DisplayWord(snapshot.codex_state));
     if (codex_values_ready) {
