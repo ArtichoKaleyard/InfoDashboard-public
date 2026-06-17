@@ -22,7 +22,9 @@
 #include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_log.h>
+#include <esp_log_write.h>
 #include <esp_netif.h>
+#include <esp_ota_ops.h>
 #include <esp_sntp.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
@@ -156,13 +158,13 @@ struct DiagnosticEntry {
     int64_t uptime_ms;
     char source[12];
     char event[20];
-    char detail[96];
+    char detail[128];
 };
 
 struct DiagnosticState {
     uint32_t next_sequence;
     uint32_t total_entries;
-    DiagnosticEntry entries[16];
+    DiagnosticEntry entries[CONFIG_DASHBOARD_LOG_RING_ENTRIES];
     int last_http_status;
     int last_http_errno;
     int last_http_tls_error;
@@ -185,6 +187,15 @@ struct DiagnosticState {
     bool last_worker_ok;
     bool last_worker_usage_summary_ok;
     int64_t last_worker_elapsed_ms;
+};
+
+struct OtaDisplayState {
+    bool active;
+    int64_t visible_until_ms;
+    uint32_t bytes;
+    uint32_t total;
+    char phase[18];
+    char message[48];
 };
 
 struct WifiProfile {
@@ -320,6 +331,7 @@ constexpr int64_t kWeatherQueueStaleMs = 45000;
 constexpr int64_t kDashboardRenderIntervalUs = 1000 * 1000;
 constexpr int64_t kDashboardRenderSlowWarnMs = 250;
 constexpr int64_t kDashboardRenderLateWarnMs = 250;
+constexpr int64_t kOtaTerminalVisibleMs = 15000;
 constexpr double kMiniChartBudgetLinePct =
     100.0 * static_cast<double>(style::kMiniChartBudgetLineNumerator) /
     static_cast<double>(style::kMiniChartBudgetLineDenominator);
@@ -351,9 +363,13 @@ SemaphoreHandle_t g_snapshot_mutex = nullptr;
 SemaphoreHandle_t g_http_mutex = nullptr;
 SemaphoreHandle_t g_network_queue_mutex = nullptr;
 SemaphoreHandle_t g_diagnostic_mutex = nullptr;
+SemaphoreHandle_t g_ota_display_mutex = nullptr;
 DashboardSnapshot g_remote_snapshot = {};
 bool g_remote_snapshot_valid = false;
 DiagnosticState g_diagnostics = {};
+OtaDisplayState g_ota_display = {};
+vprintf_like_t g_original_log_vprintf = nullptr;
+bool g_log_sink_installed = false;
 char g_codex_response[kHttpResponseCapacity] = {};
 char g_weather_response[kHttpResponseCapacity] = {};
 char g_server_monitor_response[kHttpResponseCapacity] = {};
@@ -567,7 +583,8 @@ void DiagnosticLog(const char *source, const char *event, const char *detail, ..
     }
     DiagnosticState &state = g_diagnostics;
     const uint32_t sequence = ++state.next_sequence;
-    DiagnosticEntry &entry = state.entries[(sequence - 1) % (sizeof(state.entries) / sizeof(state.entries[0]))];
+    const size_t capacity = sizeof(state.entries) / sizeof(state.entries[0]);
+    DiagnosticEntry &entry = state.entries[(sequence - 1) % capacity];
     entry.sequence = sequence;
     entry.uptime_ms = esp_timer_get_time() / 1000LL;
     CopyText(entry.source, sizeof(entry.source), source ? source : "--");
@@ -582,6 +599,34 @@ void DiagnosticLog(const char *source, const char *event, const char *detail, ..
     }
     ++state.total_entries;
     xSemaphoreGive(g_diagnostic_mutex);
+}
+
+int DashboardLogVprintf(const char *format, va_list args) {
+    va_list original_args;
+    va_copy(original_args, args);
+    const int result = g_original_log_vprintf ? g_original_log_vprintf(format, original_args)
+                                              : vprintf(format, original_args);
+    va_end(original_args);
+
+    char line[192] = {};
+    va_list copy_args;
+    va_copy(copy_args, args);
+    std::vsnprintf(line, sizeof(line), format ? format : "", copy_args);
+    va_end(copy_args);
+    const size_t length = std::strlen(line);
+    if (length > 0 && line[length - 1] == '\n') {
+        line[length - 1] = '\0';
+    }
+    DiagnosticLog("esp", "log", "%s", line);
+    return result;
+}
+
+void InstallLogSink() {
+    if (g_log_sink_installed) {
+        return;
+    }
+    g_original_log_vprintf = esp_log_set_vprintf(DashboardLogVprintf);
+    g_log_sink_installed = true;
 }
 
 void DiagnosticRecordHttp(const char *url,
@@ -2666,6 +2711,91 @@ bool StartDashboardWifi() {
     return false;
 }
 
+bool ReadOtaDisplayState(OtaDisplayState *state) {
+    if (!state || !g_ota_display_mutex) {
+        return false;
+    }
+    if (xSemaphoreTake(g_ota_display_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return false;
+    }
+    *state = g_ota_display;
+    xSemaphoreGive(g_ota_display_mutex);
+
+    if (!state->active) {
+        const int64_t now_ms = esp_timer_get_time() / 1000LL;
+        if (state->visible_until_ms <= 0 || now_ms > state->visible_until_ms) {
+            return false;
+        }
+    }
+    return state->phase[0] != '\0' || state->message[0] != '\0';
+}
+
+const char *OtaFooterDetail(const OtaDisplayState &ota) {
+    if (std::strcmp(ota.phase, "FAIL") == 0) {
+        return "failed";
+    }
+    if (std::strcmp(ota.phase, "RX") == 0) {
+        return "receiving";
+    }
+    if (std::strcmp(ota.phase, "HEADER") == 0) {
+        return "header ok";
+    }
+    if (std::strcmp(ota.phase, "SHA") == 0) {
+        return "sha check";
+    }
+    if (std::strcmp(ota.phase, "VERIFY") == 0) {
+        return std::strstr(ota.message, "descriptor") ? "app desc" : "idf check";
+    }
+    if (std::strcmp(ota.phase, "BOOT") == 0) {
+        return "boot slot";
+    }
+    if (std::strcmp(ota.phase, "REBOOT") == 0) {
+        return "rebooting";
+    }
+    return ota.message[0] != '\0' ? ota.message : "working";
+}
+
+uint32_t OtaPercent(const OtaDisplayState &ota) {
+    if (ota.total == 0) {
+        return 0;
+    }
+    const uint32_t percent = static_cast<uint32_t>((static_cast<uint64_t>(ota.bytes) * 100ULL) / ota.total);
+    return percent > 100U ? 100U : percent;
+}
+
+void BuildOtaBytesText(const OtaDisplayState &ota, char *dest, size_t dest_size) {
+    if (!dest || dest_size == 0) {
+        return;
+    }
+    if (ota.total > 0) {
+        std::snprintf(dest, dest_size, "%u/%uK",
+                      static_cast<unsigned>((ota.bytes + 1023U) / 1024U),
+                      static_cast<unsigned>((ota.total + 1023U) / 1024U));
+    } else {
+        std::snprintf(dest, dest_size, "waiting for upload");
+    }
+}
+
+void ApplyOtaFooter(const OtaDisplayState &ota) {
+    const uint32_t percent = OtaPercent(ota);
+    char link_text[48] = {};
+    if (ota.total > 0) {
+        std::snprintf(link_text, sizeof(link_text), "> OTA: %s %u%%",
+                      ota.phase[0] != '\0' ? ota.phase : "RUN",
+                      static_cast<unsigned>(percent > 100U ? 100U : percent));
+    } else {
+        std::snprintf(link_text, sizeof(link_text), "> OTA: %s",
+                      ota.phase[0] != '\0' ? ota.phase : "RUN");
+    }
+
+    char byte_text[24] = {};
+    BuildOtaBytesText(ota, byte_text, sizeof(byte_text));
+
+    lv_label_set_text(g_ui.footer_link, link_text);
+    lv_label_set_text(g_ui.footer_battery, byte_text);
+    lv_label_set_text(g_ui.footer_updated, OtaFooterDetail(ota));
+}
+
 // ===== UI 数据绑定 =====
 // 如果只改控件位置，改 dashboard_layout.h；如果改字段显示内容，改这里。
 void ApplySnapshot(const DashboardSnapshot &snapshot) {
@@ -2816,6 +2946,11 @@ void ApplySnapshot(const DashboardSnapshot &snapshot) {
         lv_label_set_text_fmt(g_ui.footer_updated, text::kFooterUpdatedFormat, LastToken(link_text));
     } else {
         lv_label_set_text(g_ui.footer_updated, text::kFooterUpdatedPlaceholder);
+    }
+
+    OtaDisplayState ota = {};
+    if (ReadOtaDisplayState(&ota)) {
+        ApplyOtaFooter(ota);
     }
 }
 
@@ -3484,12 +3619,15 @@ size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
         return 0;
     }
     dest[0] = '\0';
-    DiagnosticState diagnostic = {};
+    DiagnosticState *diagnostic = static_cast<DiagnosticState *>(std::calloc(1, sizeof(DiagnosticState)));
+    if (!diagnostic) {
+        return AppendFormat(dest, dest_size, 0, "{\"error\":\"diagnostic allocation failed\"}\n");
+    }
     DashboardSnapshot remote = {};
     const bool remote_valid = LoadRemoteSnapshot(&remote);
     if (g_diagnostic_mutex &&
         xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        diagnostic = g_diagnostics;
+        *diagnostic = g_diagnostics;
         xSemaphoreGive(g_diagnostic_mutex);
     }
 
@@ -3509,20 +3647,20 @@ size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
                         remote_valid ? "true" : "false");
     used = AppendFormat(dest, dest_size, used,
                         "  \"codex\":{\"fetch_ok\":%s,\"usage_summary_ok\":%s,\"json_ok\":%s,\"state\":",
-                        diagnostic.last_codex_fetch_ok ? "true" : "false",
-                        diagnostic.last_codex_usage_summary_ok ? "true" : "false",
-                        diagnostic.last_codex_json_ok ? "true" : "false");
-    used = AppendJsonString(dest, dest_size, used, diagnostic.last_codex_state);
+                        diagnostic->last_codex_fetch_ok ? "true" : "false",
+                        diagnostic->last_codex_usage_summary_ok ? "true" : "false",
+                        diagnostic->last_codex_json_ok ? "true" : "false");
+    used = AppendJsonString(dest, dest_size, used, diagnostic->last_codex_state);
     used = AppendFormat(dest, dest_size, used, ",\"link_state\":");
-    used = AppendJsonString(dest, dest_size, used, diagnostic.last_codex_link_state);
+    used = AppendJsonString(dest, dest_size, used, diagnostic->last_codex_link_state);
     used = AppendFormat(dest, dest_size, used,
                         ",\"week_remaining_pct\":%d,\"five_hour_remaining_pct\":%d,"
                         "\"received_epoch\":%lld,\"expired\":%s,\"error\":",
-                        diagnostic.last_codex_week_remaining_pct,
-                        diagnostic.last_codex_five_hour_remaining_pct,
-                        diagnostic.last_codex_received_epoch,
+                        diagnostic->last_codex_week_remaining_pct,
+                        diagnostic->last_codex_five_hour_remaining_pct,
+                        diagnostic->last_codex_received_epoch,
                         remote_valid && CodexSnapshotExpired(remote) ? "true" : "false");
-    used = AppendJsonString(dest, dest_size, used, diagnostic.last_codex_error);
+    used = AppendJsonString(dest, dest_size, used, diagnostic->last_codex_error);
     used = AppendFormat(dest, dest_size, used,
                         "},\n  \"remote_codex\":{\"valid\":%s,\"state\":",
                         remote_valid ? "true" : "false");
@@ -3534,33 +3672,33 @@ size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
                         remote_valid ? remote.codex_five_hour_remaining_pct : 0,
                         remote_valid ? remote.codex_received_epoch : 0,
                         remote_valid && CodexSnapshotExpired(remote) ? "true" : "false");
-    used = AppendJsonString(dest, dest_size, used, diagnostic.last_http_source);
+    used = AppendJsonString(dest, dest_size, used, diagnostic->last_http_source);
     used = AppendFormat(dest, dest_size, used, ",\"result\":");
-    used = AppendJsonString(dest, dest_size, used, diagnostic.last_http_result);
+    used = AppendJsonString(dest, dest_size, used, diagnostic->last_http_result);
     used = AppendFormat(dest, dest_size, used,
                         ",\"status\":%d,\"len\":%d,\"overflow\":%s,\"elapsed_ms\":%lld,"
                         "\"errno\":%d,\"tls_error\":%d,\"tls_flags\":%d},\n",
-                        diagnostic.last_http_status,
-                        diagnostic.last_http_len,
-                        diagnostic.last_http_overflow ? "true" : "false",
-                        diagnostic.last_http_elapsed_ms,
-                        diagnostic.last_http_errno,
-                        diagnostic.last_http_tls_error,
-                        diagnostic.last_http_tls_flags);
+                        diagnostic->last_http_status,
+                        diagnostic->last_http_len,
+                        diagnostic->last_http_overflow ? "true" : "false",
+                        diagnostic->last_http_elapsed_ms,
+                        diagnostic->last_http_errno,
+                        diagnostic->last_http_tls_error,
+                        diagnostic->last_http_tls_flags);
     used = AppendFormat(dest, dest_size, used, "  \"worker\":{\"job\":");
-    used = AppendJsonString(dest, dest_size, used, diagnostic.last_worker_job);
+    used = AppendJsonString(dest, dest_size, used, diagnostic->last_worker_job);
     used = AppendFormat(dest, dest_size, used,
                         ",\"ok\":%s,\"usage_summary_ok\":%s,\"elapsed_ms\":%lld},\n  \"logs\":[\n",
-                        diagnostic.last_worker_ok ? "true" : "false",
-                        diagnostic.last_worker_usage_summary_ok ? "true" : "false",
-                        diagnostic.last_worker_elapsed_ms);
+                        diagnostic->last_worker_ok ? "true" : "false",
+                        diagnostic->last_worker_usage_summary_ok ? "true" : "false",
+                        diagnostic->last_worker_elapsed_ms);
 
-    const size_t capacity = sizeof(diagnostic.entries) / sizeof(diagnostic.entries[0]);
-    const uint32_t count = diagnostic.total_entries < capacity ? diagnostic.total_entries : capacity;
-    const uint32_t start_sequence = diagnostic.next_sequence >= count ? diagnostic.next_sequence - count + 1 : 1;
+    const size_t capacity = sizeof(diagnostic->entries) / sizeof(diagnostic->entries[0]);
+    const uint32_t count = diagnostic->total_entries < capacity ? diagnostic->total_entries : capacity;
+    const uint32_t start_sequence = diagnostic->next_sequence >= count ? diagnostic->next_sequence - count + 1 : 1;
     for (uint32_t offset = 0; offset < count; ++offset) {
         const uint32_t sequence = start_sequence + offset;
-        const DiagnosticEntry &entry = diagnostic.entries[(sequence - 1) % capacity];
+        const DiagnosticEntry &entry = diagnostic->entries[(sequence - 1) % capacity];
         used = AppendFormat(dest, dest_size, used, "    {\"seq\":%u,\"uptime_ms\":%lld,\"source\":",
                             entry.sequence, entry.uptime_ms);
         used = AppendJsonString(dest, dest_size, used, entry.source);
@@ -3571,6 +3709,7 @@ size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
         used = AppendFormat(dest, dest_size, used, "}%s\n", offset + 1 < count ? "," : "");
     }
     used = AppendFormat(dest, dest_size, used, "  ]\n}\n");
+    std::free(diagnostic);
     return used;
 }
 
@@ -3579,10 +3718,14 @@ size_t UserApp_WriteLogsText(char *dest, size_t dest_size) {
         return 0;
     }
     dest[0] = '\0';
-    DiagnosticState diagnostic = {};
+    DiagnosticState *diagnostic = static_cast<DiagnosticState *>(std::calloc(1, sizeof(DiagnosticState)));
+    if (!diagnostic) {
+        return AppendFormat(dest, dest_size, 0,
+                            "InfoDashboard diagnostics\nRecent logs unavailable: allocation failed\n");
+    }
     if (g_diagnostic_mutex &&
         xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        diagnostic = g_diagnostics;
+        *diagnostic = g_diagnostics;
         xSemaphoreGive(g_diagnostic_mutex);
     }
 
@@ -3596,41 +3739,140 @@ size_t UserApp_WriteLogsText(char *dest, size_t dest_size) {
                         esp_timer_get_time() / 1000LL,
                         CurrentEpochSeconds(),
                         TransportReady() ? 1 : 0,
-                        diagnostic.last_codex_fetch_ok ? 1 : 0,
-                        diagnostic.last_codex_usage_summary_ok ? 1 : 0,
-                        diagnostic.last_codex_json_ok ? 1 : 0,
-                        diagnostic.last_codex_state,
-                        diagnostic.last_codex_week_remaining_pct,
-                        diagnostic.last_codex_five_hour_remaining_pct,
-                        diagnostic.last_codex_received_epoch,
-                        diagnostic.last_codex_error,
-                        diagnostic.last_http_source,
-                        diagnostic.last_http_result,
-                        diagnostic.last_http_status,
-                        diagnostic.last_http_len,
-                        diagnostic.last_http_overflow ? 1 : 0,
-                        diagnostic.last_http_elapsed_ms,
-                        diagnostic.last_http_errno,
-                        diagnostic.last_http_tls_error,
-                        diagnostic.last_http_tls_flags,
-                        diagnostic.last_worker_job,
-                        diagnostic.last_worker_ok ? 1 : 0,
-                        diagnostic.last_worker_usage_summary_ok ? 1 : 0,
-                        diagnostic.last_worker_elapsed_ms);
-    const size_t capacity = sizeof(diagnostic.entries) / sizeof(diagnostic.entries[0]);
-    const uint32_t count = diagnostic.total_entries < capacity ? diagnostic.total_entries : capacity;
-    const uint32_t start_sequence = diagnostic.next_sequence >= count ? diagnostic.next_sequence - count + 1 : 1;
+                        diagnostic->last_codex_fetch_ok ? 1 : 0,
+                        diagnostic->last_codex_usage_summary_ok ? 1 : 0,
+                        diagnostic->last_codex_json_ok ? 1 : 0,
+                        diagnostic->last_codex_state,
+                        diagnostic->last_codex_week_remaining_pct,
+                        diagnostic->last_codex_five_hour_remaining_pct,
+                        diagnostic->last_codex_received_epoch,
+                        diagnostic->last_codex_error,
+                        diagnostic->last_http_source,
+                        diagnostic->last_http_result,
+                        diagnostic->last_http_status,
+                        diagnostic->last_http_len,
+                        diagnostic->last_http_overflow ? 1 : 0,
+                        diagnostic->last_http_elapsed_ms,
+                        diagnostic->last_http_errno,
+                        diagnostic->last_http_tls_error,
+                        diagnostic->last_http_tls_flags,
+                        diagnostic->last_worker_job,
+                        diagnostic->last_worker_ok ? 1 : 0,
+                        diagnostic->last_worker_usage_summary_ok ? 1 : 0,
+                        diagnostic->last_worker_elapsed_ms);
+    const size_t capacity = sizeof(diagnostic->entries) / sizeof(diagnostic->entries[0]);
+    const uint32_t count = diagnostic->total_entries < capacity ? diagnostic->total_entries : capacity;
+    const uint32_t start_sequence = diagnostic->next_sequence >= count ? diagnostic->next_sequence - count + 1 : 1;
     for (uint32_t offset = 0; offset < count; ++offset) {
         const uint32_t sequence = start_sequence + offset;
-        const DiagnosticEntry &entry = diagnostic.entries[(sequence - 1) % capacity];
+        const DiagnosticEntry &entry = diagnostic->entries[(sequence - 1) % capacity];
         used = AppendFormat(dest, dest_size, used, "#%u %lldms %-7s %-18s %s\n",
                             entry.sequence, entry.uptime_ms, entry.source, entry.event, entry.detail);
     }
+    std::free(diagnostic);
     return used;
 }
 
+size_t UserApp_ReadLogEntriesAfter(uint32_t after_sequence, char *dest, size_t dest_size,
+                                   uint32_t *last_sequence) {
+    if (!dest || dest_size == 0) {
+        return 0;
+    }
+    dest[0] = '\0';
+    DiagnosticState *diagnostic = static_cast<DiagnosticState *>(std::calloc(1, sizeof(DiagnosticState)));
+    if (!diagnostic) {
+        if (last_sequence) {
+            *last_sequence = after_sequence;
+        }
+        return 0;
+    }
+    if (g_diagnostic_mutex &&
+        xSemaphoreTake(g_diagnostic_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        *diagnostic = g_diagnostics;
+        xSemaphoreGive(g_diagnostic_mutex);
+    }
+
+    const size_t capacity = sizeof(diagnostic->entries) / sizeof(diagnostic->entries[0]);
+    const uint32_t count = diagnostic->total_entries < capacity ? diagnostic->total_entries : capacity;
+    const uint32_t first_sequence = diagnostic->next_sequence >= count ? diagnostic->next_sequence - count + 1 : 1;
+    uint32_t start_sequence = after_sequence + 1;
+    if (start_sequence < first_sequence) {
+        start_sequence = first_sequence;
+    }
+
+    size_t used = 0;
+    uint32_t latest = after_sequence;
+    for (uint32_t sequence = start_sequence; sequence <= diagnostic->next_sequence; ++sequence) {
+        const DiagnosticEntry &entry = diagnostic->entries[(sequence - 1) % capacity];
+        if (entry.sequence != sequence) {
+            continue;
+        }
+        used = AppendFormat(dest, dest_size, used, "#%u %lldms %-7s %-18s %s\n",
+                            entry.sequence, entry.uptime_ms, entry.source, entry.event, entry.detail);
+        latest = sequence;
+        if (used + 64 >= dest_size) {
+            break;
+        }
+    }
+    if (last_sequence) {
+        *last_sequence = latest;
+    }
+    std::free(diagnostic);
+    return used;
+}
+
+void UserApp_RecordDiagnosticLog(const char *source, const char *event, const char *detail) {
+    DiagnosticLog(source, event, "%s", detail ? detail : "");
+}
+
+void UserApp_UpdateOtaProgress(const char *phase, const char *message, uint32_t bytes,
+                               uint32_t total, bool active) {
+    if (!g_ota_display_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(g_ota_display_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+    g_ota_display.active = active;
+    g_ota_display.bytes = bytes;
+    g_ota_display.total = total;
+    g_ota_display.visible_until_ms = active ? 0 : (esp_timer_get_time() / 1000LL) + kOtaTerminalVisibleMs;
+    CopyText(g_ota_display.phase, sizeof(g_ota_display.phase), phase ? phase : "");
+    CopyText(g_ota_display.message, sizeof(g_ota_display.message), message ? message : "");
+    xSemaphoreGive(g_ota_display_mutex);
+}
+
+void UserApp_MarkOtaAppValid(void) {
+#if CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+    if (running &&
+        esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
+        ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        const esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err == ESP_OK) {
+            ESP_LOGI(kTag, "OTA app marked valid");
+            DiagnosticLog("ota", "app_valid", "running partition confirmed");
+        } else {
+            ESP_LOGE(kTag, "OTA app valid mark failed: %s", esp_err_to_name(err));
+            DiagnosticLog("ota", "app_valid_fail", "%s", esp_err_to_name(err));
+        }
+    }
+#endif
+}
+
 void UserApp_AppInit(void) {
+    g_diagnostic_mutex = xSemaphoreCreateMutex();
+    if (!g_diagnostic_mutex) {
+        ESP_LOGW(kTag, "diagnostic mutex init failed");
+    }
+    g_ota_display_mutex = xSemaphoreCreateMutex();
+    if (!g_ota_display_mutex) {
+        ESP_LOGW(kTag, "OTA display mutex init failed");
+    }
+    InstallLogSink();
     ESP_LOGI(kTag, "info dashboard app init");
+    UserApp_MarkOtaAppValid();
     InitNvs();
     g_snapshot_mutex = xSemaphoreCreateMutex();
     if (!g_snapshot_mutex) {
@@ -3643,10 +3885,6 @@ void UserApp_AppInit(void) {
     g_network_queue_mutex = xSemaphoreCreateMutex();
     if (!g_network_queue_mutex) {
         ESP_LOGW(kTag, "network queue mutex init failed");
-    }
-    g_diagnostic_mutex = xSemaphoreCreateMutex();
-    if (!g_diagnostic_mutex) {
-        ESP_LOGW(kTag, "diagnostic mutex init failed");
     }
     InitBatteryAdc();
     InitShtc3();

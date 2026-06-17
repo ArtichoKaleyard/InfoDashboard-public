@@ -184,4 +184,45 @@ menu "Info Dashboard Transport"
         help
             TCP port for the read-only screenshot endpoint.
 
+    config DASHBOARD_OTA_ENABLE
+        bool "Enable authenticated local OTA upload endpoint"
+        default y
+        depends on DASHBOARD_SCREENSHOT_ENABLE
+        help
+            Add POST /ota and GET /ota/status to the diagnostic HTTP server.
+            The upload endpoint is disabled at runtime until
+            DASHBOARD_OTA_TOKEN is configured in local sdkconfig/menuconfig.
+
+    config DASHBOARD_OTA_TOKEN
+        string "Dashboard OTA upload token"
+        default ""
+        depends on DASHBOARD_OTA_ENABLE
+        help
+            Shared token required in X-Dashboard-Token for OTA uploads. Keep
+            this in local sdkconfig or menuconfig output, not committed source.
+
+    config DASHBOARD_LOG_STREAM_ENABLE
+        bool "Enable realtime diagnostic log stream"
+        default y
+        depends on DASHBOARD_SCREENSHOT_ENABLE
+        help
+            Add GET /logs/stream as a Server-Sent Events stream over the
+            diagnostic HTTP server.
+
+    config DASHBOARD_LOG_STREAM_REQUIRE_TOKEN
+        bool "Require dashboard token for log stream"
+        default y
+        depends on DASHBOARD_LOG_STREAM_ENABLE
+        help
+            Require X-Dashboard-Token on /logs/stream. This uses the same
+            local token as OTA uploads.
+
+    config DASHBOARD_LOG_RING_ENTRIES
+        int "Diagnostic log ring entries"
+        default 64
+        range 16 256
+        help
+            Number of recent log entries retained in memory for /logs.txt,
+            /diagnostics.json, and /logs/stream.
+
 endmenu

@@ -11,5 +11,5 @@ idf_component_register(
         "dashboard_font_ui_16m_1bpp.c"
         "dashboard_font_ui_segoe_semibold_16_1bpp.c"
         "dashboard_font_ui_28_1bpp.c"
-    PRIV_REQUIRES app_bsp esp-tls esp_adc esp_driver_gpio esp_driver_i2c esp_event esp_http_client esp_netif esp_timer esp_wifi json lvgl__lvgl lwip nvs_flash
+    PRIV_REQUIRES app_bsp app_update esp-tls esp_adc esp_driver_gpio esp_driver_i2c esp_event esp_http_client esp_netif esp_timer esp_wifi json lvgl__lvgl lwip nvs_flash
     INCLUDE_DIRS "./")
