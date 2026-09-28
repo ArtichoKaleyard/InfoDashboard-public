@@ -220,7 +220,7 @@ void DisplayPort::RLCD_ColorClear(uint8_t color) {
     memset(DispBuffer, color, DisplayLen);
 }
 
-void DisplayPort::RLCD_Display() {
+bool DisplayPort::RLCD_Display() {
     RLCD_SendCommand(0x2A);     // Column Address Set
   	RLCD_SendData(0x12);
   	RLCD_SendData(0x2A);
@@ -231,7 +231,7 @@ void DisplayPort::RLCD_Display() {
 
   	RLCD_SendCommand(0x2c);     // Page Address Set
 
-	RLCD_Sendbuffera(DispBuffer,DisplayLen);
+	return RLCD_Sendbuffera(DispBuffer,DisplayLen);
 }
 
 bool DisplayPort::RLCD_CopyPbmBits(uint8_t *dest, size_t dest_len) {
@@ -276,8 +276,13 @@ void DisplayPort::RLCD_SendData(uint8_t Data) {
     ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, -1, &Data, 1));
 }
 
-void DisplayPort::RLCD_Sendbuffera(uint8_t *Data, int len) {
-    ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, -1, Data, len));
+bool DisplayPort::RLCD_Sendbuffera(uint8_t *Data, int len) {
+    const esp_err_t err = esp_lcd_panel_io_tx_color(io_handle, -1, Data, len);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RLCD frame send failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    return true;
 }
 
 void DisplayPort::Set_ResetIOLevel(uint8_t level) {

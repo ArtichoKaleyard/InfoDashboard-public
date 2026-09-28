@@ -45,7 +45,7 @@ class DisplayPort {
     void Set_ResetIOLevel(uint8_t level);
     void RLCD_SendCommand(uint8_t Reg);
     void RLCD_SendData(uint8_t Data);
-    void RLCD_Sendbuffera(uint8_t *Data, int len);
+    bool RLCD_Sendbuffera(uint8_t *Data, int len);
     void RLCD_Reset(void);
 
   public:
@@ -55,7 +55,7 @@ class DisplayPort {
     void RLCD_ColorClear(uint8_t color);
     void RLCD_BeginFrame();
     void RLCD_EndFrame();
-    void RLCD_Display();
+    bool RLCD_Display();
     int Width() const;
     int Height() const;
     bool RLCD_CopyPbmBits(uint8_t *dest, size_t dest_len);

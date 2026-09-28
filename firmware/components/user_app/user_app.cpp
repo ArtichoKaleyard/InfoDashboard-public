@@ -26,6 +26,7 @@
 #include <esp_netif.h>
 #include <esp_ota_ops.h>
 #include <esp_sntp.h>
+#include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
@@ -207,7 +208,8 @@ struct WifiProfile {
 struct ServerMonitorEndpoint {
     const char *url;
     const char *label;
-    uint8_t wifi_profile;
+    int timeout_ms;
+    const char *token;
 };
 
 enum class HttpAuth {
@@ -306,6 +308,41 @@ constexpr int64_t kWifiInitialRetryDelayMs = 5000;
 constexpr int64_t kWifiMaxRetryDelayMs = 300000;
 constexpr int kHttpResponseCapacity = 16384;
 constexpr int kHttpTimeoutMs = 20000;
+constexpr int kServerMonitorPrivateTimeoutMs = 3000;
+constexpr int kServerMonitorFallbackTimeoutMs = 8000;
+constexpr int64_t kServerMonitorProbeDelayMs[] = {10000, 20000, 40000, 60000};
+struct ServerMonitorAttemptOrder {
+    size_t slots[kServerMonitorEndpointCapacity] = {};
+    size_t count = 0;
+};
+
+constexpr int64_t ServerMonitorProbeDelay(uint8_t failures) {
+    return kServerMonitorProbeDelayMs[failures < 4 ? failures : 3];
+}
+
+constexpr ServerMonitorAttemptOrder BuildServerMonitorAttemptOrder(
+    size_t active, size_t endpoint_count, int64_t now_ms, const int64_t *next_probe_ms) {
+    ServerMonitorAttemptOrder order = {};
+    for (size_t slot = 0; slot < active; ++slot) {
+        if (now_ms >= next_probe_ms[slot]) {
+            order.slots[order.count++] = slot;
+            break;
+        }
+    }
+    order.slots[order.count++] = active;
+    for (size_t slot = active + 1; slot < endpoint_count; ++slot) {
+        order.slots[order.count++] = slot;
+    }
+    return order;
+}
+
+constexpr int64_t kProbeTestDue[] = {0, 0, 0};
+constexpr int64_t kProbeTestWait[] = {20000, 0, 0};
+static_assert(BuildServerMonitorAttemptOrder(0, 3, 10000, kProbeTestDue).slots[0] == 0);
+static_assert(BuildServerMonitorAttemptOrder(2, 3, 10000, kProbeTestDue).count == 2);
+static_assert(BuildServerMonitorAttemptOrder(2, 3, 10000, kProbeTestDue).slots[0] == 0);
+static_assert(BuildServerMonitorAttemptOrder(2, 3, 10000, kProbeTestWait).slots[0] == 1);
+static_assert(ServerMonitorProbeDelay(0) == 10000 && ServerMonitorProbeDelay(4) == 60000);
 constexpr int64_t kHttpMutexWaitMs = 25000;
 constexpr int64_t kHttpsTimeSyncWaitMs = 12000;
 constexpr int kHttpKeepAliveIdleSeconds = 30;
@@ -380,6 +417,10 @@ esp_http_client_handle_t g_server_monitor_client = nullptr;
 char g_server_monitor_client_url[256] = {};
 size_t g_server_monitor_endpoint_cursor = 0;
 uint8_t g_server_monitor_endpoint_wifi_profile = kWifiInvalidProfile;
+uint8_t g_server_monitor_probe_failures[kServerMonitorEndpointCapacity] = {};
+int64_t g_server_monitor_next_probe_ms[kServerMonitorEndpointCapacity] = {};
+bool g_server_monitor_data_stale = true;
+const char *g_server_monitor_switch_reason = "startup";
 adc_oneshot_unit_handle_t g_battery_adc = nullptr;
 adc_cali_handle_t g_battery_adc_cali = nullptr;
 bool g_battery_adc_ready = false;
@@ -409,8 +450,8 @@ bool CodexApiTouched() {
 }
 
 bool ServerMonitorConfigured() {
-    return (std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_1) > 0 ||
-            std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_2) > 0 ||
+    return (std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_PRIMARY_URL) > 0 ||
+            std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_CAMPUS_URL) > 0 ||
             std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_URL) > 0) &&
            std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_TOKEN) > 0;
 }
@@ -472,51 +513,34 @@ size_t BuildServerMonitorEndpointOrder(ServerMonitorEndpoint *endpoints, size_t 
     if (!endpoints || capacity == 0) {
         return 0;
     }
-    const ServerMonitorEndpoint local_1 = {
-        CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_1,
-        "local1",
-        0,
+    const ServerMonitorEndpoint primary = {
+        CONFIG_DASHBOARD_SERVER_MONITOR_PRIMARY_URL,
+        "primary",
+        kServerMonitorPrivateTimeoutMs,
+        CONFIG_DASHBOARD_SERVER_MONITOR_PRIMARY_TOKEN,
     };
-    const ServerMonitorEndpoint local_2 = {
-        CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_2,
-        "local2",
-        1,
+    const ServerMonitorEndpoint campus = {
+        CONFIG_DASHBOARD_SERVER_MONITOR_CAMPUS_URL,
+        "campus",
+        kServerMonitorPrivateTimeoutMs,
+        CONFIG_DASHBOARD_SERVER_MONITOR_TOKEN,
     };
     const ServerMonitorEndpoint fallback = {
         CONFIG_DASHBOARD_SERVER_MONITOR_URL,
         "fallback",
-        kWifiInvalidProfile,
+        kServerMonitorFallbackTimeoutMs,
+        CONFIG_DASHBOARD_SERVER_MONITOR_PRIMARY_TOKEN,
     };
     size_t count = 0;
-    if (g_active_wifi_profile == local_1.wifi_profile) {
-        AddServerMonitorEndpoint(endpoints, &count, capacity, local_1);
-    } else if (g_active_wifi_profile == local_2.wifi_profile) {
-        AddServerMonitorEndpoint(endpoints, &count, capacity, local_2);
-    }
-    AddServerMonitorEndpoint(endpoints, &count, capacity, local_1);
-    AddServerMonitorEndpoint(endpoints, &count, capacity, local_2);
+    AddServerMonitorEndpoint(endpoints, &count, capacity, primary);
+    AddServerMonitorEndpoint(endpoints, &count, capacity, campus);
     AddServerMonitorEndpoint(endpoints, &count, capacity, fallback);
     return count;
 }
 
-bool ServerMonitorEndpointIsPreferred(const ServerMonitorEndpoint &endpoint) {
-    return endpoint.wifi_profile != kWifiInvalidProfile &&
-           endpoint.wifi_profile == g_active_wifi_profile;
-}
-
-bool ServerMonitorSnapshotUsable(const DashboardSnapshot &snapshot) {
-    return !SameText(snapshot.server_state, "OFFLINE") &&
-           !SameText(snapshot.server_state, "ERROR");
-}
-
-bool CurrentWifiHasPreferredServerMonitorEndpoint() {
-    if (g_active_wifi_profile == 0) {
-        return std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_1) > 0;
-    }
-    if (g_active_wifi_profile == 1) {
-        return std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_2) > 0;
-    }
-    return false;
+const char *ActiveWifiScene() {
+    return g_active_wifi_profile == 0 ? "campus" :
+           g_active_wifi_profile < kWifiProfileCount ? "home" : "disconnected";
 }
 
 // ===== 文本与 JSON 规整 =====
@@ -557,8 +581,8 @@ const char *DiagnosticSourceForUrl(const char *url) {
     if (matches_configured_url_family(url, CONFIG_DASHBOARD_API_URL)) {
         return "codex";
     }
-    if (matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_1) ||
-        matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_LOCAL_URL_2) ||
+    if (matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_PRIMARY_URL) ||
+        matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_CAMPUS_URL) ||
         matches_configured_url_family(url, CONFIG_DASHBOARD_SERVER_MONITOR_URL)) {
         return "server";
     }
@@ -1097,6 +1121,51 @@ const cJSON *ServerMonitorDataObject(const cJSON *root) {
         return data;
     }
     return root;
+}
+
+bool ServerMonitorPayloadValid(const char *payload, const char **reason) {
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) {
+        *reason = "json";
+        return false;
+    }
+    const cJSON *data = cJSON_GetObjectItemCaseSensitive(root, "target");
+    const cJSON *api_version = cJSON_GetObjectItemCaseSensitive(root, "api_version");
+    const cJSON *view = cJSON_GetObjectItemCaseSensitive(root, "source");
+    const cJSON *target = cJSON_GetObjectItemCaseSensitive(data, "target");
+    const cJSON *updated = cJSON_GetObjectItemCaseSensitive(data, "updated_at_raw");
+    const cJSON *ssh = cJSON_GetObjectItemCaseSensitive(data, "ssh_available");
+    const cJSON *gpus = cJSON_GetObjectItemCaseSensitive(data, "gpus");
+    char actual_target[32] = {};
+    if (cJSON_IsString(target)) {
+        CopyUpperText(actual_target, sizeof(actual_target), target->valuestring);
+    }
+    bool valid = cJSON_IsString(api_version) && SameText(api_version->valuestring, "v1") &&
+                 cJSON_IsString(view) && SameText(view->valuestring, "merged") &&
+                 cJSON_IsObject(data) && cJSON_IsString(target) &&
+                 SameText(actual_target, CONFIG_DASHBOARD_SERVER_MONITOR_DISPLAY_TARGET) &&
+                 cJSON_IsString(updated) && updated->valuestring[0] != '\0' &&
+                 cJSON_IsBool(ssh) && cJSON_IsArray(gpus);
+    *reason = valid ? "ok" : "missing_data";
+    if (valid) {
+        const cJSON *source_node = cJSON_GetObjectItemCaseSensitive(data, "source_node");
+        const cJSON *sources = cJSON_GetObjectItemCaseSensitive(data, "sources");
+        if (cJSON_IsString(source_node) && cJSON_IsArray(sources)) {
+            const cJSON *source = nullptr;
+            cJSON_ArrayForEach(source, sources) {
+                const cJSON *node = cJSON_GetObjectItemCaseSensitive(source, "source_node");
+                const cJSON *stale = cJSON_GetObjectItemCaseSensitive(source, "is_stale");
+                if (cJSON_IsString(node) && SameText(node->valuestring, source_node->valuestring) &&
+                    cJSON_IsTrue(stale)) {
+                    valid = false;
+                    *reason = "stale_source";
+                    break;
+                }
+            }
+        }
+    }
+    cJSON_Delete(root);
+    return valid;
 }
 
 bool ParseServerMonitorJson(const char *payload, DashboardSnapshot *snapshot) {
@@ -2018,12 +2087,15 @@ esp_err_t HttpEventHandler(esp_http_client_event_t *event) {
     return ESP_OK;
 }
 
-void ConfigureHttpHeaders(esp_http_client_handle_t client, HttpAuth auth) {
+void ConfigureHttpHeaders(esp_http_client_handle_t client, HttpAuth auth,
+                          const char *server_monitor_token = nullptr) {
     if (auth == HttpAuth::kCodexApiKey && std::strlen(CONFIG_DASHBOARD_API_KEY) > 0) {
         esp_http_client_set_header(client, "X-API-Key", CONFIG_DASHBOARD_API_KEY);
-    } else if (auth == HttpAuth::kServerMonitorToken && std::strlen(CONFIG_DASHBOARD_SERVER_MONITOR_TOKEN) > 0) {
+    } else if (auth == HttpAuth::kServerMonitorToken) {
+        const char *token = server_monitor_token && server_monitor_token[0] ?
+                            server_monitor_token : CONFIG_DASHBOARD_SERVER_MONITOR_TOKEN;
         char authorization[192] = {};
-        std::snprintf(authorization, sizeof(authorization), "Bearer %s", CONFIG_DASHBOARD_SERVER_MONITOR_TOKEN);
+        std::snprintf(authorization, sizeof(authorization), "Bearer %s", token);
         esp_http_client_set_header(client, "Authorization", authorization);
     }
     if (auth != HttpAuth::kNone &&
@@ -2141,7 +2213,9 @@ bool FetchReusableHttpPayload(const char *url,
                               esp_http_client_handle_t *client_slot,
                               char *client_url,
                               size_t client_url_size,
-                              int64_t *elapsed_ms = nullptr) {
+                              int64_t *elapsed_ms = nullptr,
+                              int timeout_ms = kHttpTimeoutMs,
+                              const char *server_monitor_token = nullptr) {
     if (!url || url[0] == '\0' || !response || response_size == 0 || !client_slot ||
         !client_url || client_url_size == 0) {
         return false;
@@ -2167,9 +2241,10 @@ bool FetchReusableHttpPayload(const char *url,
             GiveHttpMutex();
             return false;
         }
-        ConfigureHttpHeaders(*client_slot, auth);
+        ConfigureHttpHeaders(*client_slot, auth, server_monitor_token);
         CopyText(client_url, client_url_size, url);
     }
+    esp_http_client_set_timeout_ms(*client_slot, timeout_ms);
     const bool ok = PerformHttpPayload(*client_slot, url, &buffer, elapsed_ms);
     if (!ok) {
         esp_http_client_cleanup(*client_slot);
@@ -2192,6 +2267,10 @@ void ResetServerMonitorEndpointOrder() {
     ResetServerMonitorClient();
     g_server_monitor_endpoint_cursor = 0;
     g_server_monitor_endpoint_wifi_profile = g_active_wifi_profile;
+    std::memset(g_server_monitor_probe_failures, 0, sizeof(g_server_monitor_probe_failures));
+    std::memset(g_server_monitor_next_probe_ms, 0, sizeof(g_server_monitor_next_probe_ms));
+    g_server_monitor_data_stale = true;
+    g_server_monitor_switch_reason = "wifi_reconnect";
 }
 
 // 网络拉取只在各数据源后台任务中调用，避免阻塞每秒 UI 刷新。
@@ -2309,59 +2388,67 @@ bool FetchServerMonitorSnapshot(DashboardSnapshot *snapshot, int64_t *elapsed_ms
 
     char *response = g_server_monitor_response;
     int64_t last_elapsed_ms = -1;
-    const DashboardSnapshot base_snapshot = *snapshot;
-    DashboardSnapshot fallback_snapshot = {};
-    bool fallback_snapshot_valid = false;
-    int64_t fallback_elapsed_ms = -1;
-    for (size_t attempt = 0; attempt < endpoint_count; ++attempt) {
-        const size_t slot = (g_server_monitor_endpoint_cursor + attempt) % endpoint_count;
+    const char *last_failure_reason = "none";
+    const int64_t now_ms = esp_timer_get_time() / 1000LL;
+    const size_t active = g_server_monitor_endpoint_cursor;
+    const ServerMonitorAttemptOrder order = BuildServerMonitorAttemptOrder(
+        active, endpoint_count, now_ms, g_server_monitor_next_probe_ms);
+    for (size_t attempt = 0; attempt < order.count; ++attempt) {
+        const size_t slot = order.slots[attempt];
         const ServerMonitorEndpoint &endpoint = endpoints[slot];
         response[0] = '\0';
         int64_t attempt_elapsed_ms = -1;
         bool fetched = FetchReusableHttpPayload(endpoint.url, response, kHttpResponseCapacity,
                                                 HttpAuth::kServerMonitorToken, &g_server_monitor_client,
                                                 g_server_monitor_client_url, sizeof(g_server_monitor_client_url),
-                                                &attempt_elapsed_ms);
+                                                &attempt_elapsed_ms, endpoint.timeout_ms, endpoint.token);
         if (!fetched && attempt_elapsed_ms >= 0 &&
             attempt_elapsed_ms < kServerMonitorFastReconnectRetryMs) {
             response[0] = '\0';
             fetched = FetchReusableHttpPayload(endpoint.url, response, kHttpResponseCapacity,
                                                HttpAuth::kServerMonitorToken, &g_server_monitor_client,
                                                g_server_monitor_client_url, sizeof(g_server_monitor_client_url),
-                                               &attempt_elapsed_ms);
+                                               &attempt_elapsed_ms, endpoint.timeout_ms, endpoint.token);
+        }
+        const char *reason = "transport";
+        if (fetched && !ServerMonitorPayloadValid(response, &reason)) {
+            fetched = false;
+        }
+        DashboardSnapshot candidate = {};
+        BuildEmptySnapshot(&candidate);
+        if (fetched && !ParseServerMonitorJson(response, &candidate)) {
+            fetched = false;
+            reason = "parse";
         }
         if (!fetched) {
-            ESP_LOGW(kTag, "ServerMonitor endpoint failed: %s elapsed=%lldms",
-                     endpoint.label, attempt_elapsed_ms);
-            last_elapsed_ms = attempt_elapsed_ms;
-            continue;
-        }
-        DashboardSnapshot candidate = base_snapshot;
-        if (!ParseServerMonitorJson(response, &candidate)) {
-            ESP_LOGW(kTag, "ServerMonitor JSON parse failed: endpoint=%s", endpoint.label);
+            ESP_LOGW(kTag, "ServerMonitor endpoint failed: %s reason=%s elapsed=%lldms",
+                     endpoint.label, reason, attempt_elapsed_ms);
             ResetServerMonitorClient();
-            last_elapsed_ms = attempt_elapsed_ms;
-            continue;
-        }
-        if (!ServerMonitorSnapshotUsable(candidate) && attempt + 1 < endpoint_count) {
-            if (!fallback_snapshot_valid) {
-                fallback_snapshot = candidate;
-                fallback_elapsed_ms = attempt_elapsed_ms;
-                fallback_snapshot_valid = true;
+            if (slot < active || slot == active) {
+                uint8_t &failures = g_server_monitor_probe_failures[slot];
+                g_server_monitor_next_probe_ms[slot] = now_ms + ServerMonitorProbeDelay(failures);
+                if (failures < 4) {
+                    ++failures;
+                }
             }
-            ESP_LOGW(kTag, "ServerMonitor endpoint reported unavailable: %s state=%s elapsed=%lldms",
-                     endpoint.label, candidate.server_state, attempt_elapsed_ms);
+            g_server_monitor_switch_reason = reason;
+            last_failure_reason = reason;
             last_elapsed_ms = attempt_elapsed_ms;
             continue;
         }
+        // Only ServerMonitor fields are merged into the shared snapshot.
         *snapshot = candidate;
-        if (!CurrentWifiHasPreferredServerMonitorEndpoint() ||
-            ServerMonitorEndpointIsPreferred(endpoint)) {
-            g_server_monitor_endpoint_cursor = slot;
-        } else {
-            g_server_monitor_endpoint_cursor = 0;
+        if (slot != active) {
+            ESP_LOGI(kTag, "ServerMonitor route switch: %s -> %s reason=%s",
+                     endpoints[active].label, endpoint.label, g_server_monitor_switch_reason);
         }
+        g_server_monitor_endpoint_cursor = slot;
         g_server_monitor_endpoint_wifi_profile = g_active_wifi_profile;
+        g_server_monitor_probe_failures[slot] = 0;
+        g_server_monitor_next_probe_ms[slot] = 0;
+        g_server_monitor_data_stale = false;
+        g_server_monitor_switch_reason = slot < active ? "recovered" :
+                                         slot > active ? last_failure_reason : "steady";
         if (elapsed_ms) {
             *elapsed_ms = attempt_elapsed_ms;
         }
@@ -2372,15 +2459,7 @@ bool FetchServerMonitorSnapshot(DashboardSnapshot *snapshot, int64_t *elapsed_ms
                  snapshot->server_cpu_pct, snapshot->server_mem_pct, attempt_elapsed_ms);
         return true;
     }
-    if (fallback_snapshot_valid) {
-        *snapshot = fallback_snapshot;
-        if (elapsed_ms) {
-            *elapsed_ms = fallback_elapsed_ms;
-        }
-        CopyLocalUpdatedTimestamp(snapshot->updated_at, sizeof(snapshot->updated_at));
-        CopyText(snapshot->link_state, sizeof(snapshot->link_state), "API OK");
-        return true;
-    }
+    g_server_monitor_data_stale = true;
     if (elapsed_ms) {
         *elapsed_ms = last_elapsed_ms;
     }
@@ -3266,7 +3345,7 @@ bool ExecuteNetworkJob(NetworkJob job, int64_t *elapsed_ms, bool *usage_summary_
             if (ok) {
                 MergeSnapshot(next, MergeServerMonitorSnapshot);
             } else {
-                CopyText(next.link_state, sizeof(next.link_state), "NET SLOW");
+                CopyText(next.link_state, sizeof(next.link_state), "STALE");
                 MergeSnapshot(next, MergeLinkState);
             }
             return ok;
@@ -3593,6 +3672,44 @@ size_t AppendFormat(char *dest, size_t dest_size, size_t used, const char *forma
     return used + (advance < available ? advance : available - 1);
 }
 
+const char *ResetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:
+            return "POWERON";
+        case ESP_RST_EXT:
+            return "EXT";
+        case ESP_RST_SW:
+            return "SW";
+        case ESP_RST_PANIC:
+            return "PANIC";
+        case ESP_RST_INT_WDT:
+            return "INT_WDT";
+        case ESP_RST_TASK_WDT:
+            return "TASK_WDT";
+        case ESP_RST_WDT:
+            return "WDT";
+        case ESP_RST_DEEPSLEEP:
+            return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:
+            return "BROWNOUT";
+        case ESP_RST_SDIO:
+            return "SDIO";
+        case ESP_RST_USB:
+            return "USB";
+        case ESP_RST_JTAG:
+            return "JTAG";
+        case ESP_RST_EFUSE:
+            return "EFUSE";
+        case ESP_RST_PWR_GLITCH:
+            return "PWR_GLITCH";
+        case ESP_RST_CPU_LOCKUP:
+            return "CPU_LOCKUP";
+        case ESP_RST_UNKNOWN:
+        default:
+            return "UNKNOWN";
+    }
+}
+
 size_t AppendJsonString(char *dest, size_t dest_size, size_t used, const char *value) {
     used = AppendFormat(dest, dest_size, used, "\"");
     for (const char *cursor = value ? value : ""; *cursor != '\0' && used + 2 < dest_size; ++cursor) {
@@ -3634,17 +3751,49 @@ size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
     size_t used = 0;
     used = AppendFormat(dest, dest_size, used,
                         "{\n  \"uptime_ms\":%lld,\n  \"epoch\":%lld,\n  \"transport_ready\":%s,\n"
-                        "  \"config\":{\"codex_url\":%s,\"codex_api_key\":%s,\"cf_access\":%s,\"server_monitor\":%s},\n"
-                        "  \"snapshot_valid\":%s,\n",
+                        "  \"reset\":{\"reason\":%d,\"name\":",
                         esp_timer_get_time() / 1000LL,
                         CurrentEpochSeconds(),
                         TransportReady() ? "true" : "false",
+                        static_cast<int>(esp_reset_reason()));
+    used = AppendJsonString(dest, dest_size, used, ResetReasonName(esp_reset_reason()));
+    used = AppendFormat(dest, dest_size, used,
+                        "},\n"
+                        "  \"config\":{\"codex_url\":%s,\"codex_api_key\":%s,\"cf_access\":%s,\"server_monitor\":%s},\n"
+                        "  \"snapshot_valid\":%s,\n",
                         std::strlen(CONFIG_DASHBOARD_API_URL) > 0 ? "true" : "false",
                         std::strlen(CONFIG_DASHBOARD_API_KEY) > 0 ? "true" : "false",
                         (std::strlen(CONFIG_DASHBOARD_CF_ACCESS_CLIENT_ID) > 0 &&
                          std::strlen(CONFIG_DASHBOARD_CF_ACCESS_CLIENT_SECRET) > 0) ? "true" : "false",
                         ServerMonitorConfigured() ? "true" : "false",
                         remote_valid ? "true" : "false");
+    ServerMonitorEndpoint server_endpoints[kServerMonitorEndpointCapacity] = {};
+    const size_t server_count = BuildServerMonitorEndpointOrder(server_endpoints, kServerMonitorEndpointCapacity);
+    const size_t server_slot = g_server_monitor_endpoint_cursor < server_count ?
+                               g_server_monitor_endpoint_cursor : 0;
+    int64_t next_probe_ms = 0;
+    if (server_slot > 0) {
+        for (size_t slot = 0; slot < server_slot; ++slot) {
+            const int64_t remaining = g_server_monitor_next_probe_ms[slot] - esp_timer_get_time() / 1000LL;
+            if (remaining > 0 && (next_probe_ms == 0 || remaining < next_probe_ms)) {
+                next_probe_ms = remaining;
+            }
+        }
+    }
+    used = AppendFormat(dest, dest_size, used, "  \"wifi_profile\":%u,\"wifi_scene\":",
+                        static_cast<unsigned>(g_active_wifi_profile));
+    used = AppendJsonString(dest, dest_size, used, ActiveWifiScene());
+    used = AppendFormat(dest, dest_size, used, ",\n  \"server_monitor_route\":{\"endpoint\":");
+    used = AppendJsonString(dest, dest_size, used,
+                            server_count ? server_endpoints[server_slot].label : "none");
+    used = AppendFormat(dest, dest_size, used, ",\"reason\":");
+    used = AppendJsonString(dest, dest_size, used, g_server_monitor_switch_reason);
+    used = AppendFormat(dest, dest_size, used,
+                        ",\"probe_failures\":[%u,%u,%u],\"next_probe_ms\":%lld,\"data_stale\":%s},\n",
+                        static_cast<unsigned>(g_server_monitor_probe_failures[0]),
+                        static_cast<unsigned>(g_server_monitor_probe_failures[1]),
+                        static_cast<unsigned>(g_server_monitor_probe_failures[2]),
+                        next_probe_ms, g_server_monitor_data_stale ? "true" : "false");
     used = AppendFormat(dest, dest_size, used,
                         "  \"codex\":{\"fetch_ok\":%s,\"usage_summary_ok\":%s,\"json_ok\":%s,\"state\":",
                         diagnostic->last_codex_fetch_ok ? "true" : "false",
@@ -3696,19 +3845,27 @@ size_t UserApp_WriteDiagnosticsJson(char *dest, size_t dest_size) {
     const size_t capacity = sizeof(diagnostic->entries) / sizeof(diagnostic->entries[0]);
     const uint32_t count = diagnostic->total_entries < capacity ? diagnostic->total_entries : capacity;
     const uint32_t start_sequence = diagnostic->next_sequence >= count ? diagnostic->next_sequence - count + 1 : 1;
+    bool truncated = false;
+    uint32_t emitted = 0;
     for (uint32_t offset = 0; offset < count; ++offset) {
+        if (used + 512 >= dest_size) {
+            truncated = true;
+            break;
+        }
         const uint32_t sequence = start_sequence + offset;
         const DiagnosticEntry &entry = diagnostic->entries[(sequence - 1) % capacity];
-        used = AppendFormat(dest, dest_size, used, "    {\"seq\":%u,\"uptime_ms\":%lld,\"source\":",
+        used = AppendFormat(dest, dest_size, used, "%s    {\"seq\":%u,\"uptime_ms\":%lld,\"source\":",
+                            emitted > 0 ? ",\n" : "",
                             entry.sequence, entry.uptime_ms);
         used = AppendJsonString(dest, dest_size, used, entry.source);
         used = AppendFormat(dest, dest_size, used, ",\"event\":");
         used = AppendJsonString(dest, dest_size, used, entry.event);
         used = AppendFormat(dest, dest_size, used, ",\"detail\":");
         used = AppendJsonString(dest, dest_size, used, entry.detail);
-        used = AppendFormat(dest, dest_size, used, "}%s\n", offset + 1 < count ? "," : "");
+        used = AppendFormat(dest, dest_size, used, "}");
+        ++emitted;
     }
-    used = AppendFormat(dest, dest_size, used, "  ]\n}\n");
+    used = AppendFormat(dest, dest_size, used, "\n  ],\n  \"truncated\":%s\n}\n", truncated ? "true" : "false");
     std::free(diagnostic);
     return used;
 }
@@ -3871,7 +4028,8 @@ void UserApp_AppInit(void) {
         ESP_LOGW(kTag, "OTA display mutex init failed");
     }
     InstallLogSink();
-    ESP_LOGI(kTag, "info dashboard app init");
+    ESP_LOGI(kTag, "info dashboard app init: reset=%s(%d)",
+             ResetReasonName(esp_reset_reason()), static_cast<int>(esp_reset_reason()));
     UserApp_MarkOtaAppValid();
     InitNvs();
     g_snapshot_mutex = xSemaphoreCreateMutex();

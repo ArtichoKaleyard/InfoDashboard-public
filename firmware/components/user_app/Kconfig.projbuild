@@ -73,7 +73,7 @@ menu "Info Dashboard Transport"
 
     config DASHBOARD_SERVER_MONITOR_URL
         string "ServerMonitor status URL"
-        default "https://example.com/server-monitor/api/v1/targets/default/status"
+        default "https://example.com/server-monitor/api/v1/targets/default/status?source=merged"
         help
             Full HTTPS URL for the fallback ServerMonitor current-status
             endpoint. Keep this as the Cloudflare/public route when local
@@ -81,29 +81,35 @@ menu "Info Dashboard Transport"
             ServerMonitor card in explicit no-data state unless a local URL
             below is configured.
 
-    config DASHBOARD_SERVER_MONITOR_LOCAL_URL_1
-        string "ServerMonitor local status URL 1"
+    config DASHBOARD_SERVER_MONITOR_PRIMARY_URL
+        string "ServerMonitor primary status URL"
         default ""
         help
-            Optional LAN ServerMonitor current-status endpoint for the first
-            WiFi location. When the board connects through WiFi profile 1,
-            this endpoint is tried before other ServerMonitor URLs.
+            Preferred HTTPS current-status endpoint on the home primary node.
+            Trusted DNS may resolve it to the private address on either WiFi.
 
-    config DASHBOARD_SERVER_MONITOR_LOCAL_URL_2
-        string "ServerMonitor local status URL 2"
+    config DASHBOARD_SERVER_MONITOR_CAMPUS_URL
+        string "ServerMonitor campus status URL"
         default ""
         help
-            Optional LAN ServerMonitor current-status endpoint for the second
-            WiFi location. When the board connects through WiFi profile 2,
-            this endpoint is tried before other ServerMonitor URLs.
+            Secondary current-status endpoint on the campus ServerMonitor node.
+            It is tried after the primary node on every configured WiFi.
 
     config DASHBOARD_SERVER_MONITOR_TOKEN
         string "ServerMonitor API token"
         default ""
         help
-            ServerMonitor automation API token sent as Authorization: Bearer.
+            Campus ServerMonitor API token sent as Authorization: Bearer.
             Keep this in local sdkconfig or menuconfig output, not in committed
             source.
+
+    config DASHBOARD_SERVER_MONITOR_PRIMARY_TOKEN
+        string "Primary ServerMonitor API token"
+        default ""
+        help
+            Separate token for the home primary and published fallback.
+            Leave empty only when those endpoints share the campus token.
+            Keep this in local sdkconfig or menuconfig output, not in committed source.
 
     config DASHBOARD_SERVER_MONITOR_DISPLAY_TARGET
         string "ServerMonitor display target"
